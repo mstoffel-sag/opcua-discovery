@@ -1,0 +1,4 @@
+target/
+private.pem
+cert.der
+opcua-scan-export.json
