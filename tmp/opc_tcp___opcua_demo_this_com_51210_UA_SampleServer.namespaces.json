@@ -1,0 +1,14 @@
+{
+  "endpoint": "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer",
+  "uris": [
+    "http://opcfoundation.org/UA/",
+    "urn:demo-5:OPCFoundation:SampleServer",
+    "http://test.org/UA/Data/",
+    "http://test.org/UA/Data/Instance",
+    "http://opcfoundation.org/UA/Boiler/",
+    "http://opcfoundation.org/UA/Boiler/Instance",
+    "http://opcfoundation.org/UA/Diagnostics",
+    "http://samples.org/UA/MemoryBuffer",
+    "http://samples.org/UA/MemoryBuffer/Instance"
+  ]
+}

@@ -53,6 +53,11 @@ pub async fn run(args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
             root,
             page_size: args.traversal.page_size,
             export_file: args.output.file.clone(),
+            strategy: args.traversal.strategy,
+            workers: args.traversal.workers,
+            max_children: args.traversal.max_children,
+            retry: args.connection.retry,
+            preview_values: args.output.preview_values,
         };
         let result = crate::tui::run(session, namespaces, filters, options).await;
         conn.disconnect().await;

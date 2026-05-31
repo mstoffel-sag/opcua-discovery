@@ -12,6 +12,7 @@
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -25,9 +26,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use tokio::sync::mpsc;
 
+use crate::cli::Encoding;
 use crate::error::{Result, ScanError};
 use crate::export::{write_export, NodeRecord};
 use crate::filters::{is_subscribable, FilterSet};
@@ -38,6 +41,45 @@ use crate::opcua::node_class_name;
 use crate::opcua::value::read_values;
 use crate::subscription;
 
+/// Spinner frames for the background-job progress indicator.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// A message sent from a background job back to the UI thread.
+enum JobMsg {
+    /// Incremental progress: number of nodes processed so far.
+    Progress { processed: usize },
+    /// A lazy browse (node expansion) finished.
+    BrowseDone {
+        parent: usize,
+        result: std::result::Result<Vec<LoadedChild>, String>,
+    },
+    /// A background export finished: nodes written (or an error) and the path.
+    ExportDone {
+        result: std::result::Result<usize, String>,
+        path: PathBuf,
+    },
+}
+
+/// A child node produced by a background browse job, ready to insert.
+struct LoadedChild {
+    node_id: NodeId,
+    label: String,
+    class: NodeClass,
+    path: String,
+    expandable: bool,
+    attrs: Option<NodeAttributes>,
+}
+
+/// UI-side state describing an in-progress background job (for the progress bar).
+struct JobState {
+    /// Human label for the running job (e.g. "Exporting", "Browsing").
+    verb: String,
+    /// Nodes processed so far (totals are unknown for streaming work).
+    processed: usize,
+    /// When false, the job has no measurable unit count (pure spinner).
+    counted: bool,
+}
+
 /// Options controlling the TUI session.
 pub struct TuiOptions {
     /// Root node to anchor the tree at.
@@ -46,6 +88,12 @@ pub struct TuiOptions {
     pub page_size: u32,
     /// Default export destination for the `e` action.
     pub export_file: Option<PathBuf>,
+    /// Traversal settings reused for the concurrent background export.
+    pub strategy: crate::cli::Strategy,
+    pub workers: usize,
+    pub max_children: Option<usize>,
+    pub retry: u32,
+    pub preview_values: bool,
 }
 
 /// Run the interactive explorer until the user quits.
@@ -61,6 +109,11 @@ pub async fn run(
     app.bootstrap().await;
 
     let mut events = EventStream::new();
+    // Receiver for the currently running background job, if any.
+    let mut job_rx: Option<mpsc::Receiver<JobMsg>> = None;
+    // Animates the progress spinner while a job is running.
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+
     loop {
         app.ensure_selected_detail().await;
         guard
@@ -72,17 +125,48 @@ pub async fn run(
             break;
         }
 
-        match events.next().await {
-            Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                app.handle_key(key).await?;
+        tokio::select! {
+            // Terminal input.
+            maybe_event = events.next() => match maybe_event {
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    app.handle_key(key).await?;
+                    // A handler may have launched a background job.
+                    if let Some(rx) = app.pending_job.take() {
+                        job_rx = Some(rx);
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(ScanError::Terminal(e.to_string())),
+                None => break,
+            },
+            // Background job progress / completion.
+            msg = recv_job(&mut job_rx) => match msg {
+                Some(m) => {
+                    if app.handle_job_msg(m) {
+                        job_rx = None;
+                    }
+                }
+                None => {
+                    job_rx = None;
+                    app.job = None;
+                }
+            },
+            // Periodic redraw to animate the spinner while a job runs.
+            _ = tick.tick(), if app.job.is_some() => {
+                app.spinner = app.spinner.wrapping_add(1);
             }
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(ScanError::Terminal(e.to_string())),
-            None => break,
         }
     }
 
     Ok(())
+}
+
+/// Await the next job message, or never resolve when there is no active job.
+async fn recv_job(rx: &mut Option<mpsc::Receiver<JobMsg>>) -> Option<JobMsg> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// RAII terminal guard: enters raw mode + alternate screen on construction and
@@ -131,6 +215,10 @@ struct Node {
     loaded: bool,
     expanded: bool,
     expandable: bool,
+    /// True while a background browse for this node's children is in flight.
+    loading: bool,
+    /// Whether this node is marked for export (set on the whole subtree).
+    marked: bool,
     attrs: Option<NodeAttributes>,
     value: Option<String>,
 }
@@ -149,6 +237,16 @@ struct App {
     status: String,
     filter_query: String,
     filter_mode: bool,
+    /// When true, hide nodes that don't lead to Variables (declutter view).
+    vars_only: bool,
+    /// In-progress background job state (for the progress bar), if any.
+    job: Option<JobState>,
+    /// Cancel flag for the running background job (e.g. export).
+    job_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Receiver handed to the event loop when a job is launched.
+    pending_job: Option<mpsc::Receiver<JobMsg>>,
+    /// Spinner animation frame counter.
+    spinner: usize,
     quit: bool,
 }
 
@@ -169,9 +267,14 @@ impl App {
             visible: Vec::new(),
             selected: 0,
             list_state: ListState::default(),
-            status: "↑/↓ move · →/Enter expand · ← collapse · v value · s validate · e export · / filter · q quit".into(),
+            status: "↑/↓ move · →/← expand · space mark · V vars-only · v value · s validate · e export · / filter · q quit".into(),
             filter_query: String::new(),
             filter_mode: false,
+            vars_only: false,
+            job: None,
+            job_cancel: None,
+            pending_job: None,
+            spinner: 0,
             quit: false,
         }
     }
@@ -194,6 +297,8 @@ impl App {
             loaded: false,
             expanded: true,
             expandable: true,
+            loading: false,
+            marked: false,
             attrs: None,
             value: None,
         };
@@ -215,61 +320,88 @@ impl App {
             .filter(|s| !s.is_empty())
     }
 
-    /// Browse and attach the children of `parent_idx`, applying exclude pruning.
+    /// Browse and attach the children of `parent_idx` synchronously. Used for
+    /// the initial root load during bootstrap; interactive expansion uses the
+    /// non-blocking [`App::start_browse_job`] instead.
     async fn load_children(&mut self, parent_idx: usize) {
         if self.arena[parent_idx].loaded {
             return;
         }
         let parent_id = self.arena[parent_idx].node_id.clone();
         let parent_path = self.arena[parent_idx].path.clone();
-        let parent_depth = self.arena[parent_idx].depth;
 
-        let refs = match browse_children(&self.session, &parent_id, self.options.page_size).await {
-            Ok(refs) => refs,
+        match browse_into_children(
+            &self.session,
+            &self.filters,
+            &parent_id,
+            &parent_path,
+            self.options.page_size,
+        )
+        .await
+        {
+            Ok(children) => self.attach_children(parent_idx, children),
             Err(e) => {
                 self.status = format!("browse failed: {e}");
                 self.arena[parent_idx].loaded = true;
-                return;
+                self.arena[parent_idx].loading = false;
             }
-        };
+        }
+    }
 
-        let mut child_indices = Vec::new();
-        for reference in &refs {
-            let node_id = reference.node_id.node_id.clone();
-            let segment = segment_of(reference, &node_id);
-            let path = if parent_path.is_empty() {
-                segment.clone()
-            } else {
-                format!("{parent_path}/{segment}")
-            };
-
-            // Honour exclude patterns: do not show pruned branches.
-            if self.filters.path_decision(&path).pruned {
-                continue;
-            }
-
-            let class = reference.node_class;
+    /// Insert already-browsed children under `parent_idx`.
+    fn attach_children(&mut self, parent_idx: usize, children: Vec<LoadedChild>) {
+        let parent_depth = self.arena[parent_idx].depth;
+        let mut child_indices = Vec::with_capacity(children.len());
+        for child in children {
             let node = Node {
-                node_id,
-                label: segment,
-                class,
-                path,
+                node_id: child.node_id,
+                label: child.label,
+                class: child.class,
+                path: child.path,
                 depth: parent_depth + 1,
                 parent: Some(parent_idx),
                 children: Vec::new(),
                 loaded: false,
                 expanded: false,
-                expandable: is_expandable(class),
-                attrs: None,
+                expandable: child.expandable,
+                loading: false,
+                marked: false,
+                attrs: child.attrs,
                 value: None,
             };
             let idx = self.arena.len();
             self.arena.push(node);
             child_indices.push(idx);
         }
-
         self.arena[parent_idx].children = child_indices;
         self.arena[parent_idx].loaded = true;
+        self.arena[parent_idx].loading = false;
+    }
+
+    /// Spawn a background browse so the UI stays responsive on slow servers or
+    /// large nodes. The result is applied when the job reports back.
+    fn start_browse_job(&mut self, idx: usize) {
+        let session = self.session.clone();
+        let filters = self.filters.clone();
+        let parent_id = self.arena[idx].node_id.clone();
+        let parent_path = self.arena[idx].path.clone();
+        let page_size = self.options.page_size;
+        let (tx, rx) = mpsc::channel(4);
+
+        self.arena[idx].loading = true;
+        self.job = Some(JobState {
+            verb: format!("Browsing {}", self.arena[idx].label),
+            processed: 0,
+            counted: false,
+        });
+        self.pending_job = Some(rx);
+        self.status = format!("browsing {}…", self.arena[idx].label);
+
+        tokio::spawn(async move {
+            let result =
+                browse_into_children(&session, &filters, &parent_id, &parent_path, page_size).await;
+            let _ = tx.send(JobMsg::BrowseDone { parent: idx, result }).await;
+        });
     }
 
     /// Recompute the flattened list of visible node indices.
@@ -277,6 +409,11 @@ impl App {
         let mut visible = Vec::new();
         for &root in &self.roots {
             collect_visible(&self.arena, root, &mut visible);
+        }
+
+        if self.vars_only {
+            let keep = self.compute_vars_keep();
+            visible.retain(|&idx| keep[idx]);
         }
 
         if !self.filter_query.is_empty() {
@@ -339,9 +476,12 @@ impl App {
             }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.expand_selected().await,
             KeyCode::Left | KeyCode::Char('h') => self.collapse_selected(),
+            KeyCode::Char(' ') => self.toggle_mark_selected(),
+            KeyCode::Char('V') => self.toggle_vars_only(),
             KeyCode::Char('v') => self.preview_value().await,
             KeyCode::Char('s') => self.validate_selected().await,
             KeyCode::Char('e') => self.export(),
+            KeyCode::Char('x') => self.cancel_job(),
             KeyCode::Char('/') => {
                 self.filter_mode = true;
                 self.filter_query.clear();
@@ -395,17 +535,68 @@ impl App {
             self.status = format!("{} is a leaf node", self.arena[idx].label);
             return;
         }
-        if !self.arena[idx].loaded {
-            self.status = format!("browsing {}…", self.arena[idx].label);
-            self.load_children(idx).await;
+        if self.arena[idx].loaded {
+            // Already browsed: just reveal the children (cheap, instant).
+            self.arena[idx].expanded = true;
+            self.rebuild_visible();
+            self.status = format!(
+                "{} ({} children)",
+                self.arena[idx].label,
+                self.arena[idx].children.len()
+            );
+            return;
         }
-        self.arena[idx].expanded = true;
-        self.rebuild_visible();
-        self.status = format!(
-            "{} ({} children)",
-            self.arena[idx].label,
-            self.arena[idx].children.len()
-        );
+        if self.job.is_some() || self.arena[idx].loading {
+            self.status = "busy — please wait for the current operation".into();
+            return;
+        }
+        // Browse in the background so the UI never freezes on slow servers.
+        self.start_browse_job(idx);
+    }
+
+    /// Apply a message from the background job channel. Returns `true` when the
+    /// job has finished and its receiver should be dropped.
+    fn handle_job_msg(&mut self, msg: JobMsg) -> bool {
+        match msg {
+            JobMsg::Progress { processed } => {
+                if let Some(job) = &mut self.job {
+                    job.processed = processed;
+                    job.counted = true;
+                }
+                false
+            }
+            JobMsg::BrowseDone { parent, result } => {
+                match result {
+                    Ok(children) => {
+                        let n = children.len();
+                        self.attach_children(parent, children);
+                        self.arena[parent].expanded = true;
+                        self.status = format!("{} ({n} children)", self.arena[parent].label);
+                    }
+                    Err(e) => {
+                        self.arena[parent].loaded = true;
+                        self.arena[parent].loading = false;
+                        self.status = format!("browse failed: {e}");
+                    }
+                }
+                self.job = None;
+                self.rebuild_visible();
+                if let Some(pos) = self.visible.iter().position(|&v| v == parent) {
+                    self.selected = pos;
+                    self.list_state.select(Some(pos));
+                }
+                true
+            }
+            JobMsg::ExportDone { result, path } => {
+                self.status = match result {
+                    Ok(n) => format!("exported {n} nodes to {}", path.display()),
+                    Err(e) => format!("export failed: {e}"),
+                };
+                self.job = None;
+                self.job_cancel = None;
+                true
+            }
+        }
     }
 
     fn collapse_selected(&mut self) {
@@ -423,6 +614,102 @@ impl App {
             }
         }
         self.rebuild_visible();
+    }
+
+    /// Toggle the export mark on the selected node. Marking is *logical* and
+    /// instant: the node and its whole subtree are considered marked, but the
+    /// children are only traversed lazily when the export job runs. This keeps
+    /// the UI responsive even for huge subtrees.
+    fn toggle_mark_selected(&mut self) {
+        let Some(idx) = self.selected_idx() else {
+            return;
+        };
+        let covered = self.ancestor_marked(idx);
+        let now_marked = !self.arena[idx].marked;
+        self.arena[idx].marked = now_marked;
+        let n = self.marked_count();
+        self.status = if now_marked {
+            if covered {
+                format!(
+                    "marked {} (already inside a marked parent) · {n} subtree(s) marked",
+                    self.arena[idx].label
+                )
+            } else {
+                format!(
+                    "marked {} and all its children · {n} subtree(s) marked",
+                    self.arena[idx].label
+                )
+            }
+        } else {
+            format!("unmarked {} · {n} subtree(s) marked", self.arena[idx].label)
+        };
+    }
+
+    /// Whether any *ancestor* of `idx` is explicitly marked.
+    fn ancestor_marked(&self, idx: usize) -> bool {
+        let mut cur = self.arena[idx].parent;
+        while let Some(i) = cur {
+            if self.arena[i].marked {
+                return true;
+            }
+            cur = self.arena[i].parent;
+        }
+        false
+    }
+
+    /// Toggle hiding of nodes that don't lead to Variables.
+    fn toggle_vars_only(&mut self) {
+        self.vars_only = !self.vars_only;
+        // Keep the selection valid against the new visible set.
+        let current = self.selected_idx();
+        self.rebuild_visible();
+        if let Some(idx) = current {
+            if let Some(pos) = self.visible.iter().position(|&v| v == idx) {
+                self.selected = pos;
+                self.list_state.select(Some(pos));
+            }
+        }
+        self.status = if self.vars_only {
+            "variables-only view (V to show all)".into()
+        } else {
+            "showing all nodes".into()
+        };
+    }
+
+    /// Number of subtrees explicitly marked for export (top-level marks only).
+    fn marked_count(&self) -> usize {
+        self.arena
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.marked && n.parent.is_some() && !self.ancestor_marked(*i))
+            .count()
+    }
+
+    /// Compute, for each arena node, whether it should remain visible in the
+    /// variables-only view: Variables and any container leading to a Variable
+    /// (plus not-yet-loaded containers so the user can still drill in).
+    fn compute_vars_keep(&self) -> Vec<bool> {
+        let mut keep = vec![false; self.arena.len()];
+        for &root in &self.roots {
+            self.mark_vars_keep(root, &mut keep);
+        }
+        keep
+    }
+
+    fn mark_vars_keep(&self, idx: usize, keep: &mut [bool]) -> bool {
+        let node = &self.arena[idx];
+        let mut any = node.class == NodeClass::Variable;
+        for &child in &node.children {
+            if self.mark_vars_keep(child, keep) {
+                any = true;
+            }
+        }
+        // Keep unexplored containers so variables hidden behind them stay reachable.
+        if !node.loaded && is_expandable(node.class) && node.class != NodeClass::Variable {
+            any = true;
+        }
+        keep[idx] = any;
+        any
     }
 
     async fn preview_value(&mut self) {
@@ -464,14 +751,8 @@ impl App {
     }
 
     fn export(&mut self) {
-        let records: Vec<NodeRecord> = self
-            .arena
-            .iter()
-            .filter(|n| n.parent.is_some())
-            .map(|n| self.node_to_record(n))
-            .collect();
-        if records.is_empty() {
-            self.status = "nothing loaded to export yet".into();
+        if self.job.is_some() {
+            self.status = "busy — please wait for the current operation".into();
             return;
         }
 
@@ -481,12 +762,81 @@ impl App {
             .clone()
             .unwrap_or_else(|| PathBuf::from("opcua-scan-export.json"));
         let encoding = encoding_for(&path);
-        let mut records = records;
-        match write_export(&mut records, encoding, Some(&path)) {
-            Ok(()) => {
-                self.status = format!("exported {} nodes to {}", records.len(), path.display())
+
+        // Top-level marked nodes (a mark covers its whole subtree).
+        let marked_roots: Vec<usize> = self
+            .arena
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.marked && n.parent.is_some() && !self.ancestor_marked(*i))
+            .map(|(i, _)| i)
+            .collect();
+
+        if marked_roots.is_empty() {
+            // Nothing marked: export whatever is already loaded (in-memory, fast).
+            let mut records: Vec<NodeRecord> = self
+                .arena
+                .iter()
+                .filter(|n| n.parent.is_some())
+                .map(|n| self.node_to_record(n))
+                .collect();
+            if records.is_empty() {
+                self.status = "nothing marked or loaded to export yet".into();
+                return;
             }
-            Err(e) => self.status = format!("export failed: {e}"),
+            self.status = match write_export(&mut records, encoding, Some(&path)) {
+                Ok(()) => format!("exported {} loaded nodes to {}", records.len(), path.display()),
+                Err(e) => format!("export failed: {e}"),
+            };
+            return;
+        }
+
+        // Concurrent background export of each marked subtree (like the CLI scan).
+        let roots: Vec<ExportRoot> = marked_roots
+            .iter()
+            .map(|&idx| ExportRoot {
+                node_id: self.arena[idx].node_id.clone(),
+                path: self.arena[idx].path.clone(),
+                record: self.node_to_record(&self.arena[idx]),
+            })
+            .collect();
+
+        let session = self.session.clone();
+        let filters = self.filters.clone();
+        let namespaces = self.namespaces.clone();
+        let tmpl = ExportTemplate {
+            strategy: self.options.strategy,
+            workers: self.options.workers,
+            page_size: self.options.page_size,
+            max_children: self.options.max_children,
+            retry: self.options.retry,
+            preview_values: self.options.preview_values,
+        };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(16);
+
+        self.job = Some(JobState {
+            verb: format!("Exporting {} subtree(s)", roots.len()),
+            processed: 0,
+            counted: true,
+        });
+        self.job_cancel = Some(cancel.clone());
+        self.pending_job = Some(rx);
+        self.status = "exporting in background… (x to cancel)".into();
+
+        tokio::spawn(async move {
+            export_job(
+                session, filters, namespaces, roots, tmpl, path, encoding, cancel, tx,
+            )
+            .await;
+        });
+    }
+
+    /// Request cancellation of the running background job, if any.
+    fn cancel_job(&mut self) {
+        if let Some(cancel) = &self.job_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.status = "cancelling…".into();
         }
     }
 
@@ -522,13 +872,50 @@ impl App {
 
     /// Render the whole UI.
     fn render(&mut self, f: &mut Frame) {
-        let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
+        // Reserve a progress row only while a background job is running.
+        let constraints = if self.job.is_some() {
+            vec![
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ]
+        } else {
+            vec![Constraint::Min(1), Constraint::Length(1)]
+        };
+        let outer = Layout::vertical(constraints).split(f.area());
         let panes = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(outer[0]);
 
         self.render_tree(f, panes[0]);
         self.render_detail(f, panes[1]);
-        self.render_footer(f, outer[1]);
+        if self.job.is_some() {
+            self.render_progress(f, outer[1]);
+            self.render_footer(f, outer[2]);
+        } else {
+            self.render_footer(f, outer[1]);
+        }
+    }
+
+    /// Render an animated progress bar for the active background job.
+    fn render_progress(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        let spinner = SPINNER[self.spinner % SPINNER.len()];
+        // Total is unknown for streaming work, so animate a "throbber" sweep and
+        // surface the live processed count in the label instead of a percentage.
+        let ratio = ((self.spinner % 20) as f64) / 19.0;
+        let ratio = if ratio > 1.0 { 2.0 - ratio } else { ratio };
+        let label = if job.counted {
+            format!("{spinner} {} · {} nodes · x to cancel", job.verb, job.processed)
+        } else {
+            format!("{spinner} {}…", job.verb)
+        };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(label);
+        f.render_widget(gauge, area);
     }
 
     fn render_tree(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -547,8 +934,17 @@ impl App {
                 } else {
                     "  "
                 };
+                let (check, check_style) = if self.arena[idx].marked {
+                    ("[x] ", Style::default().fg(Color::Green))
+                } else if self.ancestor_marked(idx) {
+                    // Covered by a marked ancestor: show a lighter tick.
+                    ("[+] ", Style::default().fg(Color::Green))
+                } else {
+                    ("[ ] ", Style::default().fg(Color::DarkGray))
+                };
                 let class = short_class(node.class);
                 let line = Line::from(vec![
+                    Span::styled(check, check_style),
                     Span::raw(format!("{indent}{marker}")),
                     Span::styled(node.label.clone(), Style::default().fg(Color::White)),
                     Span::styled(format!("  {class}"), Style::default().fg(Color::DarkGray)),
@@ -557,11 +953,18 @@ impl App {
             })
             .collect();
 
-        let title = if self.filter_query.is_empty() {
+        let marked = self.marked_count();
+        let mut title = if self.filter_query.is_empty() {
             "Address space".to_string()
         } else {
             format!("Address space  [filter: {}]", self.filter_query)
         };
+        if self.vars_only {
+            title.push_str("  [vars-only]");
+        }
+        if marked > 0 {
+            title.push_str(&format!("  [{marked} marked]"));
+        }
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(
@@ -664,6 +1067,157 @@ fn collect_visible(arena: &[Node], idx: usize, out: &mut Vec<usize>) {
             collect_visible(arena, child, out);
         }
     }
+}
+
+/// Browse one node's children, prune excluded paths, and batch-read attributes
+/// in a single service call. Shared by the synchronous bootstrap load and the
+/// background browse job so neither does per-child round-trips.
+async fn browse_into_children(
+    session: &Session,
+    filters: &FilterSet,
+    parent_id: &NodeId,
+    parent_path: &str,
+    page_size: u32,
+) -> std::result::Result<Vec<LoadedChild>, String> {
+    let refs = browse_children(session, parent_id, page_size)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Build paths and drop excluded branches before reading attributes.
+    let mut kept: Vec<(ReferenceDescription, NodeId, String, String)> = Vec::new();
+    for reference in refs {
+        let node_id = reference.node_id.node_id.clone();
+        let segment = segment_of(&reference, &node_id);
+        let path = if parent_path.is_empty() {
+            segment.clone()
+        } else {
+            format!("{parent_path}/{segment}")
+        };
+        if filters.path_decision(&path).pruned {
+            continue;
+        }
+        kept.push((reference, node_id, segment, path));
+    }
+
+    // One batched attribute read for every surviving child.
+    let child_ids: Vec<NodeId> = kept.iter().map(|(_, id, _, _)| id.clone()).collect();
+    let attrs: Vec<Option<NodeAttributes>> = match read_node_attributes(session, &child_ids).await {
+        Ok(a) => a.into_iter().map(Some).collect(),
+        Err(_) => vec![None; child_ids.len()],
+    };
+
+    let children = kept
+        .into_iter()
+        .zip(attrs)
+        .map(|((reference, node_id, segment, path), attr)| {
+            let class = reference.node_class;
+            LoadedChild {
+                node_id,
+                label: segment,
+                class,
+                path,
+                expandable: is_expandable(class),
+                attrs: attr,
+            }
+        })
+        .collect();
+    Ok(children)
+}
+
+/// A subtree root selected for export.
+struct ExportRoot {
+    node_id: NodeId,
+    path: String,
+    record: NodeRecord,
+}
+
+/// Traversal settings reused by the background export's concurrent engine.
+struct ExportTemplate {
+    strategy: crate::cli::Strategy,
+    workers: usize,
+    page_size: u32,
+    max_children: Option<usize>,
+    retry: u32,
+    preview_values: bool,
+}
+
+/// Background export: run a concurrent [`crate::scanner::Engine`] scan rooted at
+/// each marked subtree, stream progress to the UI, and write the file. Reusing
+/// the engine means the export benefits from the same worker-pool concurrency
+/// as the non-interactive `browse` command.
+#[allow(clippy::too_many_arguments)]
+async fn export_job(
+    session: Arc<Session>,
+    filters: Arc<FilterSet>,
+    namespaces: Arc<NamespaceTable>,
+    roots: Vec<ExportRoot>,
+    tmpl: ExportTemplate,
+    path: PathBuf,
+    encoding: Encoding,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: mpsc::Sender<JobMsg>,
+) {
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    let mut records: Vec<NodeRecord> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut processed = 0usize;
+
+    for root in roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Include the marked node itself, then its full subtree.
+        if seen.insert(root.record.node_id.clone()) {
+            records.push(root.record.clone());
+            processed += 1;
+        }
+
+        let config = Arc::new(crate::scanner::ScanConfig {
+            root: root.node_id.clone(),
+            // Always traverse the whole marked subtree regardless of the
+            // interactive depth, since the user chose this branch explicitly.
+            depth: crate::cli::Depth::Unlimited,
+            strategy: tmpl.strategy,
+            workers: tmpl.workers,
+            page_size: tmpl.page_size,
+            max_children: tmpl.max_children,
+            retry: tmpl.retry,
+            preview_values: tmpl.preview_values,
+        });
+        let engine = crate::scanner::Engine::new(
+            session.clone(),
+            config,
+            filters.clone(),
+            namespaces.clone(),
+            cancel.clone(),
+        );
+
+        let (rtx, mut rrx) = mpsc::channel::<NodeRecord>(1024);
+        let handle = tokio::spawn(async move { engine.run(rtx).await });
+
+        while let Some(mut record) = rrx.recv().await {
+            // Engine paths are relative to its root; restore the absolute path.
+            if !root.path.is_empty() {
+                record.browse_path = format!("{}/{}", root.path, record.browse_path);
+            }
+            if seen.insert(record.node_id.clone()) {
+                records.push(record);
+                processed += 1;
+                if processed % 64 == 0 {
+                    let _ = tx.send(JobMsg::Progress { processed }).await;
+                }
+            }
+        }
+        let _ = handle.await;
+    }
+
+    let result = write_export(&mut records, encoding, Some(&path))
+        .map(|()| records.len())
+        .map_err(|e| e.to_string());
+    let _ = tx.send(JobMsg::ExportDone { result, path }).await;
 }
 
 /// A node class likely to have hierarchical children worth expanding.
