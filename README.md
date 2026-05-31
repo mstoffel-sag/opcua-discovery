@@ -360,4 +360,4 @@ cargo test
 
 ## License
 
-MPL-2.0
+Apache-2.0
