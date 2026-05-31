@@ -74,6 +74,7 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
     // current index so pre-marking matches the live tree even if the server
     // reordered its namespace array.
     let mut selected_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut selected_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(cfg) = &acquire_cfg {
         for node in &cfg.selection.nodes {
             let id = crate::acquire::selection::remap_node_id(
@@ -82,6 +83,11 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
                 &namespaces,
             )?;
             selected_ids.insert(id.to_string());
+            if let Some(path) = &node.path {
+                if !path.is_empty() {
+                    selected_paths.insert(path.clone());
+                }
+            }
         }
         // Legacy bare ids carry no URI: use them verbatim.
         selected_ids.extend(cfg.selection.node_ids.iter().cloned());
@@ -107,6 +113,7 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
             connection: gen_connection(&args.connection, conn.endpoint()),
             acquire_file,
             selected_ids,
+            selected_paths,
             source_config,
         };
         let result = crate::tui::run(session, namespaces, filters, options).await;

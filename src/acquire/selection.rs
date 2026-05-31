@@ -5,7 +5,7 @@
 //! nodes. The result is a de-duplicated list of nodes with a friendly
 //! measurement name for output.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -164,6 +164,18 @@ async fn resolve_explicit(
             .configured_name
             .or_else(|| attr.display_name.clone())
             .unwrap_or_else(|| p.id.to_string());
+
+        // Skip nodes the server reports as not currently readable: reading them
+        // only ever yields `BadNotReadable`, so they cannot be sampled by any
+        // mode. Warn so the user understands why a configured node is dropped.
+        if attr.is_unreadable_variable() {
+            warn!(
+                node_id = %p.id,
+                node = %name,
+                "skipping non-readable node (AccessLevel has no CurrentRead); it cannot be sampled"
+            );
+            continue;
+        }
 
         // Resolve the full browse path: use the cached value when present,
         // otherwise reconstruct it from the server and remember it for caching.
@@ -335,6 +347,24 @@ enum PropKind {
     EngineeringUnits,
 }
 
+/// Classify a selected node as an `EURange` / `EngineeringUnits` property based
+/// on its browse name (falling back to the last browse-path segment when the
+/// browse name was not read).
+fn property_kind(node: &SelectedNode) -> Option<PropKind> {
+    let name = node
+        .meta
+        .browse_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| node.path.rsplit('/').next())
+        .unwrap_or("");
+    match name {
+        "EURange" => Some(PropKind::EuRange),
+        "EngineeringUnits" => Some(PropKind::EngineeringUnits),
+        _ => None,
+    }
+}
+
 /// Discover each node's `EURange` / `EngineeringUnits` properties, fold their
 /// decoded values into the parent's [`SampleMeta`], and drop any property that
 /// was also selected as a standalone node (so it is not emitted on its own).
@@ -351,6 +381,9 @@ async fn enrich_metadata(session: &Session, nodes: &mut Vec<SelectedNode>) -> Re
     let mut to_read: Vec<NodeId> = Vec::new();
     let mut targets: Vec<(usize, PropKind)> = Vec::new();
     let mut folded: HashSet<NodeId> = HashSet::new();
+
+    // (A) Top-down: discover each selected node's EURange / EngineeringUnits
+    // child properties and fold their values into that parent.
     for (idx, refs) in property_lists.iter().enumerate() {
         for reference in refs {
             let browse_name = reference.browse_name.name.to_string();
@@ -363,6 +396,29 @@ async fn enrich_metadata(session: &Session, nodes: &mut Vec<SelectedNode>) -> Re
             folded.insert(prop_id.clone());
             to_read.push(prop_id);
             targets.push((idx, kind));
+        }
+    }
+
+    // (B) Bottom-up: some configs list an EURange / EngineeringUnits property
+    // node itself as a standalone selection. Such a node is metadata, not a
+    // measurement, and reading it on its own only yields a null value. Fold its
+    // value into the parent variable (matched by browse path) when that parent
+    // is also selected, and always drop it so it is not sampled standalone.
+    let path_index: HashMap<String, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.path.clone(), i))
+        .collect();
+    for node in nodes.iter() {
+        let Some(kind) = property_kind(node) else {
+            continue;
+        };
+        folded.insert(node.node_id.clone());
+        if let Some((parent_path, _)) = node.path.rsplit_once('/') {
+            if let Some(&parent_idx) = path_index.get(parent_path) {
+                to_read.push(node.node_id.clone());
+                targets.push((parent_idx, kind));
+            }
         }
     }
 

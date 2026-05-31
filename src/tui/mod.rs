@@ -106,6 +106,10 @@ pub struct TuiOptions {
     /// Node ids pre-selected from a loaded `acquire` config; these are marked in
     /// the tree as they are encountered while browsing.
     pub selected_ids: std::collections::HashSet<String>,
+    /// Browse paths (relative to the root) of the pre-selected nodes, used to
+    /// auto-expand the tree to those nodes on startup so they are revealed and
+    /// marked without the user having to hunt for them.
+    pub selected_paths: std::collections::HashSet<String>,
     /// When set, the `a` action edits this existing config in place (updating
     /// only the selection) instead of generating a fresh file with a prompt.
     pub source_config: Option<PathBuf>,
@@ -122,6 +126,7 @@ pub async fn run(
 
     let mut app = App::new(session, namespaces, filters, options);
     app.bootstrap().await;
+    app.locate_selected().await;
 
     let mut events = EventStream::new();
     // Receiver for the currently running background job, if any.
@@ -440,6 +445,66 @@ impl App {
                 self.located,
                 self.options.selected_ids.len()
             );
+        }
+    }
+
+    /// Reveal pre-selected nodes loaded from a config by browsing down to each
+    /// one and expanding its ancestors, so they appear marked (`[x]`) on startup
+    /// instead of staying hidden behind collapsed, never-loaded branches.
+    ///
+    /// The crawl is bounded to the branches that actually lead to a selected
+    /// node: a node is only descended into when its browse path is a prefix of
+    /// some selected node's saved path. Nodes are marked by id in
+    /// [`App::attach_children`], so legacy ids without a saved path are still
+    /// matched as long as they fall on a revealed branch.
+    async fn locate_selected(&mut self) {
+        if self.options.selected_ids.is_empty() || self.options.selected_paths.is_empty() {
+            return;
+        }
+
+        // Every path prefix that leads to a selected node, e.g. the selection
+        // "FCX001/Measurement" contributes {"FCX001", "FCX001/Measurement"}.
+        let mut prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for full in &self.options.selected_paths {
+            let mut acc = String::new();
+            for segment in full.split('/') {
+                if acc.is_empty() {
+                    acc.push_str(segment);
+                } else {
+                    acc.push('/');
+                    acc.push_str(segment);
+                }
+                prefixes.insert(acc.clone());
+            }
+        }
+
+        // Breadth-first descent, loading children only along needed branches.
+        let mut queue: std::collections::VecDeque<usize> = self.roots.iter().copied().collect();
+        while let Some(idx) = queue.pop_front() {
+            let path = self.arena[idx].path.clone();
+            // The root (empty path) is always descended; otherwise only branches
+            // that lead to a selected node.
+            if !path.is_empty() && !prefixes.contains(&path) {
+                continue;
+            }
+            if !self.arena[idx].loaded {
+                self.load_children(idx).await;
+            }
+            self.arena[idx].expanded = true;
+            for child in self.arena[idx].children.clone() {
+                queue.push_back(child);
+            }
+        }
+
+        // Park the cursor on the first revealed selection for convenience.
+        self.rebuild_visible();
+        if let Some(pos) = self
+            .visible
+            .iter()
+            .position(|&idx| self.arena[idx].marked)
+        {
+            self.selected = pos;
+            self.list_state.select(Some(pos));
         }
     }
 
@@ -992,15 +1057,26 @@ impl App {
 
         if marked_roots.is_empty() {
             // Nothing marked: use the Variables already loaded in memory.
-            let nodes: Vec<crate::acquire::generate::GenNode> = self
+            let candidates: Vec<&Node> = self
                 .arena
                 .iter()
                 .filter(|n| n.parent.is_some() && n.class == NodeClass::Variable)
+                .collect();
+            let skipped = candidates
+                .iter()
+                .filter(|n| node_is_unreadable_variable(n))
+                .count();
+            let nodes: Vec<crate::acquire::generate::GenNode> = candidates
+                .iter()
+                .filter(|n| !node_is_unreadable_variable(n))
                 .map(|n| self.node_to_gennode(n))
                 .collect();
             if nodes.is_empty() {
-                self.status =
-                    "no variables marked or loaded — mark nodes with space, then press a".into();
+                self.status = if skipped > 0 {
+                    format!("no readable variables (skipped {skipped} non-readable) — mark nodes with space, then press a")
+                } else {
+                    "no variables marked or loaded — mark nodes with space, then press a".into()
+                };
                 return;
             }
             self.write_acquire_config(nodes, mode, interval);
@@ -1536,7 +1612,10 @@ async fn collect_job(
         }
 
         // Include the marked node itself if it is a Variable.
-        if root.record.node_class == "Variable" && seen.insert(root.record.node_id.clone()) {
+        if root.record.node_class == "Variable"
+            && !record_is_unreadable_variable(&root.record)
+            && seen.insert(root.record.node_id.clone())
+        {
             nodes.push(to_gennode(&root.record));
         }
 
@@ -1563,7 +1642,10 @@ async fn collect_job(
 
         while let Some(record) = rrx.recv().await {
             processed += 1;
-            if record.node_class == "Variable" && seen.insert(record.node_id.clone()) {
+            if record.node_class == "Variable"
+                && !record_is_unreadable_variable(&record)
+                && seen.insert(record.node_id.clone())
+            {
                 nodes.push(to_gennode(&record));
             }
             if processed % 64 == 0 {
@@ -1611,6 +1693,29 @@ fn is_expandable(class: NodeClass) -> bool {
             | NodeClass::ObjectType
             | NodeClass::VariableType
     )
+}
+
+/// Whether this tree node is a Variable the server reports as *not* currently
+/// readable: such nodes only ever return `BadNotReadable`, so they must not be
+/// written into an acquire config. Unknown access levels are treated as
+/// readable, so nodes are only excluded on explicit evidence.
+fn node_is_unreadable_variable(node: &Node) -> bool {
+    node.class == NodeClass::Variable
+        && node
+            .attrs
+            .as_ref()
+            .map(|a| a.is_unreadable_variable())
+            .unwrap_or(false)
+}
+
+/// Same as [`node_is_unreadable_variable`] but for a discovered [`NodeRecord`]
+/// (used by the background subtree collection, which works on records).
+fn record_is_unreadable_variable(record: &NodeRecord) -> bool {
+    record.node_class == "Variable"
+        && record
+            .access_level
+            .map(|a| a & crate::opcua::attributes::access::CURRENT_READ == 0)
+            .unwrap_or(false)
 }
 
 /// Short class tag for the tree list.

@@ -54,6 +54,20 @@ impl NodeAttributes {
             .unwrap_or(false)
     }
 
+    /// Whether this node is a Variable the server reports as *not* currently
+    /// readable (its AccessLevel is present but lacks the CurrentRead bit).
+    ///
+    /// Reading such a node returns `BadNotReadable`, so it cannot be sampled by
+    /// any acquisition mode. Returns `false` when the AccessLevel is unknown so
+    /// nodes are only excluded on explicit evidence.
+    pub fn is_unreadable_variable(&self) -> bool {
+        matches!(self.node_class, Some(NodeClass::Variable))
+            && self
+                .access_level
+                .map(|a| a & access::CURRENT_READ == 0)
+                .unwrap_or(false)
+    }
+
     /// Whether this node is historizing.
     pub fn is_historizing(&self) -> bool {
         self.historizing.unwrap_or(false)
