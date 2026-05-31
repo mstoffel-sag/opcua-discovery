@@ -51,6 +51,8 @@ async-opcua = { version = "0.18", default-features = false, features = ["client"
 tempfile = "3"
 
 [profile.release]
-lto = "thin"
+opt-level = "z"
+lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
