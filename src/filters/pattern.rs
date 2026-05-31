@@ -179,4 +179,64 @@ mod tests {
         assert!(!set.matches("x"));
         assert!(set.prefix_compatible("x"));
     }
+
+    #[test]
+    fn literal_prefix_stops_at_first_wildcard() {
+        assert_eq!(literal_prefix("Line1/Motor/*"), "Line1/Motor/");
+        assert_eq!(literal_prefix("Line1/*/Speed"), "Line1/");
+        assert_eq!(literal_prefix("*/Motor"), "");
+        assert_eq!(literal_prefix("Plain/Path"), "Plain/Path");
+        assert_eq!(literal_prefix("a?b"), "a");
+        assert_eq!(literal_prefix("a[bc]"), "a");
+        assert_eq!(literal_prefix("a{b,c}"), "a");
+    }
+
+    #[test]
+    fn invalid_glob_and_regex_are_reported() {
+        // Unbalanced bracket is an invalid glob.
+        assert!(PatternSet::compile(&["a[".into()], &[]).is_err());
+        // Unbalanced group is an invalid regex.
+        assert!(PatternSet::compile(&[], &["(".into()]).is_err());
+    }
+
+    #[test]
+    fn multiple_globs_are_ored_together() {
+        let set = PatternSet::compile(&["**/Temperature".into(), "**/Speed".into()], &[]).unwrap();
+        assert!(set.matches("Factory/Line1/Motor/Temperature"));
+        assert!(set.matches("Factory/Line1/Motor/Speed"));
+        assert!(!set.matches("Factory/Line1/Motor/Torque"));
+    }
+
+    #[test]
+    fn prefix_compatible_handles_partial_last_segment() {
+        let set = PatternSet::compile(&["Line1/Mot*".into()], &[]).unwrap();
+        // "Mot" is a partial of "Motor" so the branch is descendable.
+        assert!(set.prefix_compatible("Line1/Motor"));
+        assert!(set.prefix_compatible("Line1"));
+        assert!(!set.prefix_compatible("Line2"));
+    }
+
+    proptest::proptest! {
+        /// Invariant: a concrete glob match must never be pruned during descent.
+        /// If a full path matches a glob, every ancestor prefix of that path
+        /// must be reported as `prefix_compatible` (otherwise traversal would
+        /// stop before reaching the matching node).
+        #[test]
+        fn matches_implies_ancestors_are_descendable(
+            seg in proptest::collection::vec("[A-Za-z][A-Za-z0-9]{0,5}", 1..6)
+        ) {
+            let path = seg.join("/");
+            // A glob anchored on the full literal path.
+            let set = PatternSet::compile(std::slice::from_ref(&path), &[]).unwrap();
+            proptest::prop_assert!(set.matches(&path));
+            // Every ancestor prefix must remain descendable.
+            for i in 1..seg.len() {
+                let ancestor = seg[..i].join("/");
+                proptest::prop_assert!(
+                    set.prefix_compatible(&ancestor),
+                    "ancestor {ancestor:?} pruned for path {path:?}"
+                );
+            }
+        }
+    }
 }

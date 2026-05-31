@@ -133,10 +133,7 @@ impl From<&GenNode> for GenNodeToml {
 /// `[[selection.node]]` entries (the TUI gathers them from unordered
 /// collections), producing spurious diffs.
 fn sort_key(n: &GenNode) -> (String, String) {
-    (
-        n.namespace.clone().unwrap_or_default(),
-        n.id.clone(),
-    )
+    (n.namespace.clone().unwrap_or_default(), n.id.clone())
 }
 
 #[derive(Debug, Serialize)]
@@ -176,7 +173,7 @@ pub fn generate_toml(
 
     // Stable ordering so an unchanged selection always serializes identically.
     let mut nodes = nodes;
-    nodes.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    nodes.sort_by_key(sort_key);
 
     // Resolve which modes are in play to decide which task blocks to emit.
     let resolved = |n: &GenNode| n.mode.unwrap_or(default_mode);
@@ -228,10 +225,7 @@ pub fn generate_toml(
             security_policy: conn.security_policy.clone(),
             security_mode: conn.security_mode.clone(),
             user: conn.user.clone(),
-            pki_dir: conn
-                .pki_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            pki_dir: conn.pki_dir.as_ref().map(|p| p.display().to_string()),
         },
         acquire,
         selection: GenSelectionToml {
@@ -282,7 +276,7 @@ pub fn update_selection_in_toml(original: &str, nodes: &[GenNode]) -> Result<Str
     // Stable ordering so re-saving an unchanged selection does not reorder the
     // `[[selection.node]]` entries.
     let mut nodes: Vec<&GenNode> = nodes.iter().collect();
-    nodes.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    nodes.sort_by_key(|n| sort_key(n));
 
     let mut tables = ArrayOfTables::new();
     for node in nodes {
@@ -376,14 +370,23 @@ mod tests {
         .expect("generate");
 
         let parsed = AcquireConfig::from_toml(&toml).expect("re-parse generated config");
-        assert_eq!(parsed.connection.endpoint.as_deref(), Some("opc.tcp://host:4840"));
+        assert_eq!(
+            parsed.connection.endpoint.as_deref(),
+            Some("opc.tcp://host:4840")
+        );
         assert!(parsed.connection.trust_server);
         assert_eq!(parsed.selection.nodes.len(), 2);
-        assert_eq!(parsed.selection.nodes[0].id, "ns=2;s=Foo");
-        assert_eq!(parsed.selection.nodes[0].namespace.as_deref(), Some("urn:example"));
-        assert_eq!(parsed.selection.nodes[0].name.as_deref(), Some("Foo"));
-        assert_eq!(parsed.selection.nodes[1].id, "i=2258");
-        assert!(parsed.selection.nodes[1].namespace.is_none());
+        // Nodes are written in a deterministic `(namespace, id)` order so an
+        // unchanged selection always serializes identically; the base-namespace
+        // node (empty URI) therefore sorts ahead of the `urn:example` node.
+        assert_eq!(parsed.selection.nodes[0].id, "i=2258");
+        assert!(parsed.selection.nodes[0].namespace.is_none());
+        assert_eq!(parsed.selection.nodes[1].id, "ns=2;s=Foo");
+        assert_eq!(
+            parsed.selection.nodes[1].namespace.as_deref(),
+            Some("urn:example")
+        );
+        assert_eq!(parsed.selection.nodes[1].name.as_deref(), Some("Foo"));
         assert_eq!(parsed.tasks.len(), 1);
         assert!(matches!(parsed.tasks[0], TaskConfig::Poll { .. }));
     }
@@ -430,7 +433,10 @@ mod tests {
 
         let parsed = AcquireConfig::from_toml(&toml).expect("re-parse generated config");
         // Both poll and subscribe task blocks are present.
-        assert!(parsed.tasks.iter().any(|t| matches!(t, TaskConfig::Poll { .. })));
+        assert!(parsed
+            .tasks
+            .iter()
+            .any(|t| matches!(t, TaskConfig::Poll { .. })));
         assert!(parsed
             .tasks
             .iter()
@@ -487,10 +493,16 @@ interval = \"5s\"
 
         let parsed = AcquireConfig::from_toml(&updated).expect("re-parse updated config");
         assert_eq!(parsed.selection.nodes.len(), 2);
-        assert_eq!(parsed.selection.nodes[0].id, "ns=2;s=A");
-        assert_eq!(parsed.selection.nodes[0].namespace.as_deref(), Some("urn:example"));
-        assert_eq!(parsed.selection.nodes[0].name.as_deref(), Some("A"));
-        assert_eq!(parsed.selection.nodes[1].id, "ns=2;s=B");
+        // Deterministic `(namespace, id)` ordering: the base-namespace node
+        // (empty URI) sorts ahead of the `urn:example` node.
+        assert_eq!(parsed.selection.nodes[0].id, "ns=2;s=B");
+        assert!(parsed.selection.nodes[0].namespace.is_none());
+        assert_eq!(parsed.selection.nodes[1].id, "ns=2;s=A");
+        assert_eq!(
+            parsed.selection.nodes[1].namespace.as_deref(),
+            Some("urn:example")
+        );
+        assert_eq!(parsed.selection.nodes[1].name.as_deref(), Some("A"));
         assert!(parsed.selection.node_ids.is_empty());
         assert!(matches!(parsed.tasks[0], TaskConfig::Poll { .. }));
     }
@@ -538,8 +550,14 @@ interval = \"1s\"
         let updated = update_node_paths_in_toml(
             original,
             &[
-                ("ns=4;i=1276".to_string(), "Boiler #1/LX001/ControlOut".to_string()),
-                ("ns=4;i=1244".to_string(), "Boiler #1/CC001/Output".to_string()),
+                (
+                    "ns=4;i=1276".to_string(),
+                    "Boiler #1/LX001/ControlOut".to_string(),
+                ),
+                (
+                    "ns=4;i=1244".to_string(),
+                    "Boiler #1/CC001/Output".to_string(),
+                ),
             ],
         )
         .expect("update paths");

@@ -316,7 +316,8 @@ pub async fn run_subscription(
         .iter()
         .map(|n| {
             let mut req: MonitoredItemCreateRequest = n.node_id.clone().into();
-            req.requested_parameters.sampling_interval = params.sampling_interval.as_millis() as f64;
+            req.requested_parameters.sampling_interval =
+                params.sampling_interval.as_millis() as f64;
             req.requested_parameters.queue_size = params.queue_size;
             req
         })

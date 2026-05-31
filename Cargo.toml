@@ -49,6 +49,10 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 [dev-dependencies]
 async-opcua = { version = "0.18", default-features = false, features = ["client", "server"] }
 tempfile = "3"
+# Parametrized / table-driven tests for readable, low-duplication suites.
+rstest = "0.23"
+# Property-based testing for pure logic (filters, value conversion).
+proptest = "1"
 
 [profile.release]
 opt-level = "z"

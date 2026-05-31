@@ -147,10 +147,7 @@ pub async fn reconstruct_browse_path(
 
 /// Browse the first inverse `HierarchicalReferences` parent of `node_id`,
 /// returning its node id and browse-name path segment.
-async fn browse_parent(
-    session: &Session,
-    node_id: &NodeId,
-) -> Result<Option<(NodeId, String)>> {
+async fn browse_parent(session: &Session, node_id: &NodeId) -> Result<Option<(NodeId, String)>> {
     let desc = BrowseDescription {
         node_id: node_id.clone(),
         browse_direction: BrowseDirection::Inverse,

@@ -1,7 +1,7 @@
 //! Historical (raw) data retrieval via the OPC UA HistoryRead service.
 
-use opcua::client::Session;
 use opcua::client::HistoryReadAction;
+use opcua::client::Session;
 use opcua::types::{
     DateTime, HistoryData, HistoryReadResult, HistoryReadValueId, NodeId, NumericRange,
     QualifiedName, ReadRawModifiedDetails, TimestampsToReturn,

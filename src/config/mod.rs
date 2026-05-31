@@ -276,3 +276,103 @@ fn profile_dirs() -> Vec<PathBuf> {
     }
     dirs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{SecurityModeArg, SecurityPolicyArg};
+
+    /// A baseline `ConnectionArgs` equivalent to "no CLI flags given" (all at
+    /// their built-in defaults), so profile merge can be exercised.
+    fn default_connection() -> ConnectionArgs {
+        ConnectionArgs {
+            endpoint: None,
+            user: None,
+            password: None,
+            cert: None,
+            key: None,
+            security_policy: SecurityPolicyArg::None,
+            security_mode: SecurityModeArg::None,
+            trust_server: false,
+            pki_dir: None,
+            timeout: default_timeout(),
+            retry: DEFAULT_RETRY,
+            cache: None,
+        }
+    }
+
+    #[test]
+    fn profile_parses_kebab_case_fields() {
+        let yaml = r#"
+endpoint: opc.tcp://host:4840/
+user: operator
+security-policy: Basic256Sha256
+security-mode: SignAndEncrypt
+trust-server: true
+include:
+  - "**/Temperature"
+node-class:
+  - Variable
+"#;
+        let p: Profile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.endpoint.as_deref(), Some("opc.tcp://host:4840/"));
+        assert_eq!(p.user.as_deref(), Some("operator"));
+        assert_eq!(p.security_policy.as_deref(), Some("Basic256Sha256"));
+        assert_eq!(p.trust_server, Some(true));
+        assert_eq!(p.include, vec!["**/Temperature".to_string()]);
+        assert_eq!(p.node_class, vec!["Variable".to_string()]);
+    }
+
+    #[test]
+    fn unknown_profile_field_is_rejected() {
+        let yaml = "endpoint: opc.tcp://x/\nbogus-field: 1\n";
+        assert!(serde_yaml::from_str::<Profile>(yaml).is_err());
+    }
+
+    #[test]
+    fn apply_connection_fills_unset_values() {
+        let profile: Profile = serde_yaml::from_str(
+            "endpoint: opc.tcp://host:4840/\nsecurity-policy: Basic256Sha256\ntrust-server: true\nretry: 5\n",
+        )
+        .unwrap();
+        let mut args = default_connection();
+        profile.apply_connection(&mut args).unwrap();
+        assert_eq!(args.endpoint.as_deref(), Some("opc.tcp://host:4840/"));
+        assert_eq!(args.security_policy, SecurityPolicyArg::Basic256Sha256);
+        assert!(args.trust_server);
+        assert_eq!(args.retry, 5);
+    }
+
+    #[test]
+    fn cli_values_win_over_profile() {
+        let profile: Profile = serde_yaml::from_str(
+            "endpoint: opc.tcp://from-profile/\nsecurity-policy: Basic256Sha256\nretry: 5\n",
+        )
+        .unwrap();
+        let mut args = default_connection();
+        // Simulate CLI-provided values.
+        args.endpoint = Some("opc.tcp://from-cli/".to_string());
+        args.security_policy = SecurityPolicyArg::Aes256Sha256RsaPss;
+        args.retry = 9;
+        profile.apply_connection(&mut args).unwrap();
+        // None of the profile values should override the explicit CLI values.
+        assert_eq!(args.endpoint.as_deref(), Some("opc.tcp://from-cli/"));
+        assert_eq!(args.security_policy, SecurityPolicyArg::Aes256Sha256RsaPss);
+        assert_eq!(args.retry, 9);
+    }
+
+    #[test]
+    fn load_resolves_a_direct_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.yaml");
+        std::fs::write(&path, "endpoint: opc.tcp://host:4840/\n").unwrap();
+        let profile = Profile::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(profile.endpoint.as_deref(), Some("opc.tcp://host:4840/"));
+    }
+
+    #[test]
+    fn load_reports_missing_profile() {
+        let err = Profile::load("definitely-not-a-real-profile-xyz").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+}

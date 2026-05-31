@@ -47,3 +47,47 @@ pub fn node_class_name(class: NodeClass) -> &'static str {
         NodeClass::Unspecified => "Unspecified",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::NodeClassArg;
+
+    #[test]
+    fn cli_arg_maps_to_wire_node_class() {
+        assert_eq!(node_class_of(NodeClassArg::Object), NodeClass::Object);
+        assert_eq!(node_class_of(NodeClassArg::Variable), NodeClass::Variable);
+        assert_eq!(node_class_of(NodeClassArg::Method), NodeClass::Method);
+        assert_eq!(
+            node_class_of(NodeClassArg::ObjectType),
+            NodeClass::ObjectType
+        );
+        assert_eq!(
+            node_class_of(NodeClassArg::VariableType),
+            NodeClass::VariableType
+        );
+        assert_eq!(
+            node_class_of(NodeClassArg::ReferenceType),
+            NodeClass::ReferenceType
+        );
+        assert_eq!(node_class_of(NodeClassArg::DataType), NodeClass::DataType);
+        assert_eq!(node_class_of(NodeClassArg::View), NodeClass::View);
+    }
+
+    #[test]
+    fn every_node_class_has_a_stable_name() {
+        for (class, name) in [
+            (NodeClass::Object, "Object"),
+            (NodeClass::Variable, "Variable"),
+            (NodeClass::Method, "Method"),
+            (NodeClass::ObjectType, "ObjectType"),
+            (NodeClass::VariableType, "VariableType"),
+            (NodeClass::ReferenceType, "ReferenceType"),
+            (NodeClass::DataType, "DataType"),
+            (NodeClass::View, "View"),
+            (NodeClass::Unspecified, "Unspecified"),
+        ] {
+            assert_eq!(node_class_name(class), name);
+        }
+    }
+}

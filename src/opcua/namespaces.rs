@@ -98,3 +98,57 @@ fn extract_string_array(value: Variant) -> Vec<String> {
         _ => Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> NamespaceTable {
+        NamespaceTable::from_uris(vec![
+            "http://opcfoundation.org/UA/".to_string(),
+            "urn:server:local".to_string(),
+            "urn:vendor:custom".to_string(),
+        ])
+    }
+
+    #[test]
+    fn index_and_uri_round_trip() {
+        let t = table();
+        assert_eq!(t.uri(0), Some("http://opcfoundation.org/UA/"));
+        assert_eq!(t.uri(2), Some("urn:vendor:custom"));
+        assert_eq!(t.index("urn:server:local"), Some(1));
+        assert_eq!(t.index("urn:vendor:custom"), Some(2));
+    }
+
+    #[test]
+    fn unknown_index_and_uri_return_none() {
+        let t = table();
+        assert_eq!(t.uri(99), None);
+        assert_eq!(t.index("urn:not:present"), None);
+    }
+
+    #[test]
+    fn display_hides_base_namespace_but_shows_others() {
+        let t = table();
+        // ns 0 (the OPC UA base namespace) is implied and rendered empty so
+        // browse paths stay clean.
+        assert_eq!(t.display(0), "");
+        assert_eq!(t.display(1), "urn:server:local");
+        // An index with no URI falls back to an explicit `ns=N` marker.
+        assert_eq!(t.display(7), "ns=7");
+    }
+
+    #[test]
+    fn extract_string_array_handles_array_scalar_and_other() {
+        let arr = Variant::from(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            extract_string_array(arr),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            extract_string_array(Variant::String("solo".into())),
+            vec!["solo".to_string()]
+        );
+        assert!(extract_string_array(Variant::Boolean(true)).is_empty());
+    }
+}

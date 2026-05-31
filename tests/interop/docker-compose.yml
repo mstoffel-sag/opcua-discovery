@@ -1,0 +1,71 @@
+# Reference OPC UA servers for cross-implementation interoperability testing.
+#
+# Bring them up (see also `just servers-up`):
+#     docker compose -f tests/interop/docker-compose.yml up -d
+#
+# Then point the interop suite at them and run it:
+#     export OPCUA_INTEROP_ENDPOINTS="opcplc=opc.tcp://127.0.0.1:50000/,node-opcua=opc.tcp://127.0.0.1:4841/"
+#     cargo test --test interop -- --ignored
+#
+# Tear down:
+#     docker compose -f tests/interop/docker-compose.yml down
+#
+# The two services below pull/build cleanly and cover two independent stacks
+# (.NET and Node.js). Additional implementations (open62541, Eclipse Milo and
+# the OPC Foundation reference server) are provided as commented, opt-in
+# services; uncomment and supply an image or build context to extend the matrix.
+
+services:
+  # Microsoft OPC-PLC — a .NET (UA-.NETStandard based) simulation server with a
+  # rich, configurable address space. Exposes an unsecured anonymous endpoint
+  # for easy interop checks and auto-accepts client certificates.
+  opcplc:
+    image: mcr.microsoft.com/iotedge/opc-plc:latest
+    container_name: opcua-interop-opcplc
+    command:
+      - "--pn=50000"
+      - "--autoaccept"
+      - "--unsecuretransport"
+      - "--ph=127.0.0.1"
+      - "--sn=5"
+      - "--sr=10"
+    ports:
+      - "50000:50000"
+    restart: unless-stopped
+
+  # node-opcua sample server — a Node.js implementation. Built from the small
+  # context in ./node-opcua so no third-party image is required.
+  node-opcua:
+    build:
+      context: ./node-opcua
+    container_name: opcua-interop-node-opcua
+    environment:
+      OPCUA_PORT: "4841"
+    ports:
+      - "4841:4841"
+    restart: unless-stopped
+
+  # --- Optional, opt-in implementations -------------------------------------
+  #
+  # open62541 (C). No canonical published server image exists; build the
+  # `server_ctt` / `tutorial_server_variable` example into an image, then add a
+  # service here exposing opc.tcp://...:4842/.
+  #
+  # open62541:
+  #   build: ./open62541
+  #   ports: ["4842:4840"]
+  #
+  # Eclipse Milo (Java) demo server. Build from
+  # https://github.com/eclipse/milo (examples/server) into an image.
+  #
+  # milo:
+  #   build: ./milo
+  #   ports: ["4843:12686"]
+  #
+  # OPC Foundation .NET reference server (ConsoleReferenceServer) from
+  # https://github.com/OPCFoundation/UA-.NETStandard. Build the
+  # ConsoleReferenceServer Docker image and expose its endpoint.
+  #
+  # refserver:
+  #   build: ./refserver
+  #   ports: ["4844:62541"]

@@ -343,18 +343,30 @@ The underlying OPC UA libraries are kept at `warn` unless you pass `-vvv`.
 
 ```bash
 cargo fmt
-cargo clippy --all-targets
-cargo test
+cargo clippy --all-targets -- -D warnings
+cargo test            # 98 hermetic tests, no network required
 ```
 
-Integration tests spin up an **in-process OPC UA server** with a small known address
-space (`Factory/Line1/Motor/{Temperature, Speed}`) and drive the compiled binary against
-it. To run the tests against an **external** server instead, set:
+If you have [`just`](https://github.com/casey/just) installed, the common
+workflows are wrapped as recipes (`just test`, `just lint`, `just fmt-check`,
+`just servers-up`, `just test-interop`, …). Run `just` to list them.
+
+Integration tests spin up an **in-process OPC UA server** with a known address
+space (`Factory/Line1/Motor/...`, including typed, historizing and secured
+nodes) and drive the compiled binary against it. To run the tests against an
+**external** server instead, set:
 
 ```bash
 export OPCUA_TEST_ENDPOINT=opc.tcp://localhost:4840
 cargo test
 ```
+
+A cross-implementation **interoperability** suite (`tests/interop.rs`) exercises
+the CLI against real third-party servers (open62541, node-opcua, Eclipse Milo,
+OPC Foundation reference server, Microsoft OPC-PLC, public demo). It is
+`#[ignore]`d by default and runs nightly in CI. See **[docs/TESTING.md](docs/TESTING.md)**
+for the full testing guide (test tiers, spinning up reference servers, debugging
+failures and adding new interoperability cases).
 
 ---
 

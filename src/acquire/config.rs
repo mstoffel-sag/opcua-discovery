@@ -137,7 +137,10 @@ impl AcquireConfig {
         if let Some(m) = self.acquire.default_mode {
             return m;
         }
-        let has_poll = self.tasks.iter().any(|t| matches!(t, TaskConfig::Poll { .. }));
+        let has_poll = self
+            .tasks
+            .iter()
+            .any(|t| matches!(t, TaskConfig::Poll { .. }));
         let has_subscribe = self
             .tasks
             .iter()
@@ -632,7 +635,13 @@ max_values = 1000
         assert!(args.trust_server);
         assert_eq!(args.timeout, Duration::from_secs(5));
 
-        assert!(matches!(config.tasks[0], TaskConfig::Scan { workers: Some(4), .. }));
+        assert!(matches!(
+            config.tasks[0],
+            TaskConfig::Scan {
+                workers: Some(4),
+                ..
+            }
+        ));
         assert!(matches!(config.tasks[1], TaskConfig::Poll { .. }));
         assert!(matches!(config.tasks[2], TaskConfig::Subscribe { .. }));
         assert!(matches!(config.tasks[3], TaskConfig::History { .. }));

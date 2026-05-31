@@ -324,4 +324,155 @@ mod tests {
         assert!(!is_subscribable(&attrs));
         let _ = Identifier::Numeric(1);
     }
+
+    #[test]
+    fn builtin_datatype_table_covers_all_scalar_primitives() {
+        // Every concrete scalar primitive must map to a canonical name so the
+        // emitted `dataType` field is stable across servers.
+        for (id, name, canonical) in [
+            (1u32, "Boolean", Some("bool")),
+            (2, "SByte", Some("int8")),
+            (3, "Byte", Some("uint8")),
+            (4, "Int16", Some("int16")),
+            (5, "UInt16", Some("uint16")),
+            (6, "Int32", Some("int32")),
+            (7, "UInt32", Some("uint32")),
+            (8, "Int64", Some("int64")),
+            (9, "UInt64", Some("uint64")),
+            (10, "Float", Some("float32")),
+            (11, "Double", Some("float64")),
+            (12, "String", Some("string")),
+            (13, "DateTime", Some("datetime")),
+            (14, "Guid", Some("guid")),
+            (15, "ByteString", Some("bytes")),
+        ] {
+            let node = NodeId::new(0, id);
+            assert_eq!(builtin_datatype_name(&node), Some(name), "id {id}");
+            assert_eq!(canonical_data_type(name), canonical, "name {name}");
+        }
+    }
+
+    #[test]
+    fn builtin_subtypes_fold_to_their_primitive() {
+        // Duration (290) and UtcTime (294) are common server data types that
+        // must still produce typed values.
+        assert_eq!(
+            builtin_datatype_name(&NodeId::new(0, 290u32)),
+            Some("Double")
+        );
+        assert_eq!(
+            builtin_datatype_name(&NodeId::new(0, 294u32)),
+            Some("DateTime")
+        );
+        assert_eq!(
+            builtin_datatype_name(&NodeId::new(0, 295u32)),
+            Some("String")
+        );
+    }
+
+    #[test]
+    fn builtin_name_is_namespace_zero_numeric_only() {
+        // Non-zero namespace -> not a builtin.
+        assert_eq!(builtin_datatype_name(&NodeId::new(2, 11u32)), None);
+        // String identifiers in ns 0 are not builtin numeric ids.
+        assert_eq!(builtin_datatype_name(&NodeId::new(0, "Double")), None);
+    }
+
+    #[test]
+    fn datatype_matcher_by_namespace_uri() {
+        let ns = NamespaceTable::from_uris(vec![
+            "http://opcfoundation.org/UA/".into(),
+            "urn:vendor:types".into(),
+        ]);
+        let m = DataTypeMatcher::compile(&["urn:vendor:types".into()], &ns).unwrap();
+        let vendor_type = NodeId::new(1, 5000u32);
+        let base_type = NodeId::new(0, 11u32);
+        assert!(m.matches(Some(&vendor_type), &ns));
+        assert!(!m.matches(Some(&base_type), &ns));
+        // A node with no data type never matches a non-empty matcher.
+        assert!(!m.matches(None, &ns));
+    }
+
+    #[test]
+    fn empty_datatype_matcher_accepts_everything() {
+        let ns = NamespaceTable::from_uris(vec!["http://opcfoundation.org/UA/".into()]);
+        let m = DataTypeMatcher::compile(&[], &ns).unwrap();
+        assert!(m.is_empty());
+        assert!(m.matches(None, &ns));
+        assert!(m.matches(Some(&NodeId::new(0, 1u32)), &ns));
+    }
+
+    fn attrs(class: NodeClass, access: u8) -> NodeAttributes {
+        NodeAttributes {
+            node_class: Some(class),
+            access_level: Some(access),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn predicate_node_class_filter_gates_emission() {
+        let ns = NamespaceTable::from_uris(vec!["http://opcfoundation.org/UA/".into()]);
+        let filters = FilterArgs {
+            node_class: vec![crate::cli::NodeClassArg::Variable],
+            ..Default::default()
+        };
+        let p = Predicate::compile(&filters, &ns).unwrap();
+        let id = NodeId::new(0, 1u32);
+        assert!(p.matches(&id, &attrs(NodeClass::Variable, 1), &ns));
+        assert!(!p.matches(&id, &attrs(NodeClass::Object, 1), &ns));
+    }
+
+    #[test]
+    fn predicate_access_and_historizing_flags() {
+        let ns = NamespaceTable::from_uris(vec!["http://opcfoundation.org/UA/".into()]);
+        let id = NodeId::new(0, 1u32);
+
+        let readable_only = FilterArgs {
+            readable: true,
+            ..Default::default()
+        };
+        let p = Predicate::compile(&readable_only, &ns).unwrap();
+        assert!(p.matches(&id, &attrs(NodeClass::Variable, 1), &ns));
+        assert!(!p.matches(&id, &attrs(NodeClass::Variable, 0), &ns));
+
+        let historizing = FilterArgs {
+            historizing: true,
+            ..Default::default()
+        };
+        let p = Predicate::compile(&historizing, &ns).unwrap();
+        let mut hist = attrs(NodeClass::Variable, 1);
+        assert!(!p.matches(&id, &hist, &ns));
+        hist.historizing = Some(true);
+        assert!(p.matches(&id, &hist, &ns));
+    }
+
+    #[test]
+    fn predicate_namespace_filter_rejects_unknown_uri() {
+        let ns = NamespaceTable::from_uris(vec!["http://opcfoundation.org/UA/".into()]);
+        let filters = FilterArgs {
+            ns_uri: Some("urn:not:present".into()),
+            ..Default::default()
+        };
+        let err = Predicate::compile(&filters, &ns).unwrap_err();
+        assert!(
+            err.to_string().contains("not present"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predicate_namespace_index_filter_restricts_by_node_namespace() {
+        let ns = NamespaceTable::from_uris(vec![
+            "http://opcfoundation.org/UA/".into(),
+            "urn:vendor".into(),
+        ]);
+        let filters = FilterArgs {
+            ns_index: Some(1),
+            ..Default::default()
+        };
+        let p = Predicate::compile(&filters, &ns).unwrap();
+        assert!(p.matches(&NodeId::new(1, 10u32), &attrs(NodeClass::Variable, 1), &ns));
+        assert!(!p.matches(&NodeId::new(0, 10u32), &attrs(NodeClass::Variable, 1), &ns));
+    }
 }

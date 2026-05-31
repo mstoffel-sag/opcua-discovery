@@ -36,10 +36,7 @@ impl ValueReading {
             .as_ref()
             .map(variant_to_json)
             .unwrap_or(serde_json::Value::Null);
-        let status = dv
-            .status
-            .filter(|s| !s.is_good())
-            .map(|s| s.to_string());
+        let status = dv.status.filter(|s| !s.is_good()).map(|s| s.to_string());
         ValueReading {
             value,
             source_time: dv.source_timestamp.as_ref().map(|t| t.to_rfc3339()),
@@ -50,7 +47,9 @@ impl ValueReading {
 
     /// Best available timestamp (source preferred over server).
     pub fn best_time(&self) -> Option<String> {
-        self.source_time.clone().or_else(|| self.server_time.clone())
+        self.source_time
+            .clone()
+            .or_else(|| self.server_time.clone())
     }
 }
 
@@ -86,9 +85,7 @@ pub fn variant_to_json(v: &Variant) -> serde_json::Value {
         Variant::ExpandedNodeId(id) => Value::String(id.to_string()),
         Variant::XmlElement(x) => Value::String(x.to_string()),
         Variant::ExtensionObject(obj) => extension_object_to_json(obj),
-        Variant::Array(arr) => {
-            Value::Array(arr.values.iter().map(variant_to_json).collect())
-        }
+        Variant::Array(arr) => Value::Array(arr.values.iter().map(variant_to_json).collect()),
         other => Value::String(other.to_string()),
     }
 }
@@ -274,5 +271,124 @@ mod tests {
         });
         let dv = data_value(Variant::ExtensionObject(obj));
         assert_eq!(eu_label_from_data_value(&dv), Some("°C".to_string()));
+    }
+
+    #[test]
+    fn scalar_variants_keep_native_json_types() {
+        use serde_json::Value;
+        assert_eq!(variant_to_json(&Variant::Empty), Value::Null);
+        assert_eq!(variant_to_json(&Variant::Boolean(true)), Value::Bool(true));
+        // Signed/unsigned integers stay numeric and exact.
+        assert_eq!(variant_to_json(&Variant::SByte(-7)), Value::from(-7));
+        assert_eq!(variant_to_json(&Variant::Byte(200)), Value::from(200));
+        assert_eq!(
+            variant_to_json(&Variant::Int16(-30000)),
+            Value::from(-30000)
+        );
+        assert_eq!(variant_to_json(&Variant::UInt16(60000)), Value::from(60000));
+        assert_eq!(
+            variant_to_json(&Variant::Int32(-2_000_000)),
+            Value::from(-2_000_000)
+        );
+        assert_eq!(
+            variant_to_json(&Variant::UInt32(4_000_000_000)),
+            Value::from(4_000_000_000u32)
+        );
+        assert_eq!(
+            variant_to_json(&Variant::Int64(-9_000_000_000)),
+            Value::from(-9_000_000_000i64)
+        );
+        assert_eq!(
+            variant_to_json(&Variant::UInt64(18_000_000_000)),
+            Value::from(18_000_000_000u64)
+        );
+        // Floating point values are rendered as JSON numbers.
+        assert_eq!(variant_to_json(&Variant::Double(2.5)), Value::from(2.5));
+        assert_eq!(variant_to_json(&Variant::Float(1.5f32)), Value::from(1.5));
+        // Strings.
+        assert_eq!(
+            variant_to_json(&Variant::String("hi".into())),
+            Value::String("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn non_finite_floats_become_null_not_invalid_json() {
+        // serde_json cannot represent NaN/Infinity, so the converter must emit
+        // `null` rather than produce a value that fails to serialize.
+        assert!(variant_to_json(&Variant::Double(f64::NAN)).is_null());
+        assert!(variant_to_json(&Variant::Double(f64::INFINITY)).is_null());
+        assert!(variant_to_json(&Variant::Double(f64::NEG_INFINITY)).is_null());
+        assert!(variant_to_json(&Variant::Float(f32::NAN)).is_null());
+        // Whatever comes out must round-trip through serde_json without error.
+        let v = variant_to_json(&Variant::Double(f64::NAN));
+        assert_eq!(serde_json::to_string(&v).unwrap(), "null");
+    }
+
+    #[test]
+    fn byte_string_is_base64_encoded() {
+        let json = variant_to_json(&Variant::ByteString(vec![0x00, 0x01, 0xff].into()));
+        // base64 of [0,1,255] is "AAH/".
+        assert_eq!(json, serde_json::Value::String("AAH/".to_string()));
+    }
+
+    #[test]
+    fn arrays_are_converted_element_wise() {
+        let arr = Variant::from(vec![1i32, 2, 3]);
+        let json = variant_to_json(&arr);
+        assert_eq!(json, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn localized_text_and_qualified_name_render_as_text() {
+        let lt = Variant::LocalizedText(Box::new(LocalizedText::new("en", "Hello")));
+        assert_eq!(
+            variant_to_json(&lt),
+            serde_json::Value::String("Hello".into())
+        );
+    }
+
+    #[test]
+    fn best_time_prefers_source_over_server() {
+        let reading = ValueReading {
+            value: serde_json::Value::from(1),
+            source_time: Some("2020-01-01T00:00:00Z".into()),
+            server_time: Some("2020-01-02T00:00:00Z".into()),
+            status: None,
+        };
+        assert_eq!(reading.best_time().as_deref(), Some("2020-01-01T00:00:00Z"));
+
+        let server_only = ValueReading {
+            value: serde_json::Value::Null,
+            source_time: None,
+            server_time: Some("2020-01-02T00:00:00Z".into()),
+            status: None,
+        };
+        assert_eq!(
+            server_only.best_time().as_deref(),
+            Some("2020-01-02T00:00:00Z")
+        );
+
+        let none = ValueReading {
+            value: serde_json::Value::Null,
+            source_time: None,
+            server_time: None,
+            status: None,
+        };
+        assert_eq!(none.best_time(), None);
+    }
+
+    #[test]
+    fn reading_records_non_good_status_only() {
+        use opcua::types::StatusCode;
+        let mut dv = data_value(Variant::Double(1.0));
+        dv.status = Some(StatusCode::Good);
+        assert_eq!(ValueReading::from_data_value(&dv).status, None);
+        dv.status = Some(StatusCode::BadNotReadable);
+        let reading = ValueReading::from_data_value(&dv);
+        assert!(
+            reading.status.is_some(),
+            "non-good status should be recorded"
+        );
     }
 }

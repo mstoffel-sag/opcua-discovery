@@ -45,9 +45,8 @@ pub async fn run(
     let conn = Connection::connect(&connection_args).await?;
     let session = conn.session().clone();
 
-    let namespaces = Arc::new(
-        crate::cli::load_namespaces(&session, &connection_args, conn.endpoint()).await?,
-    );
+    let namespaces =
+        Arc::new(crate::cli::load_namespaces(&session, &connection_args, conn.endpoint()).await?);
     let sink = Arc::new(Sink::new(&config.output)?);
 
     // Resolve concrete nodes once; shared by poll/subscribe/history tasks.
@@ -56,9 +55,14 @@ pub async fn run(
         .iter()
         .any(|t| !matches!(t, TaskConfig::Scan { .. }));
     let nodes = if needs_nodes {
-        let resolved =
-            selection::resolve(&session, &config, &namespaces, conn.endpoint(), cancel.clone())
-                .await?;
+        let resolved = selection::resolve(
+            &session,
+            &config,
+            &namespaces,
+            conn.endpoint(),
+            cancel.clone(),
+        )
+        .await?;
         // Cache any reconstructed browse paths back into the source config so
         // later runs can skip the inverse browse.
         if let Some(path) = config_path {
@@ -335,8 +339,7 @@ async fn run_poll(
         return;
     }
     let node_ids: Vec<NodeId> = nodes.iter().map(|n| n.node_id.clone()).collect();
-    let metas: Vec<Arc<SampleMeta>> =
-        nodes.iter().map(|n| Arc::new(n.meta.clone())).collect();
+    let metas: Vec<Arc<SampleMeta>> = nodes.iter().map(|n| Arc::new(n.meta.clone())).collect();
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -351,9 +354,7 @@ async fn run_poll(
 
         match read_readings(session, &node_ids).await {
             Ok(readings) => {
-                for ((node, reading), meta) in
-                    nodes.iter().zip(readings.iter()).zip(metas.iter())
-                {
+                for ((node, reading), meta) in nodes.iter().zip(readings.iter()).zip(metas.iter()) {
                     let sample = Sample {
                         name: node.name.clone(),
                         node_id: node.node_id.to_string(),
@@ -416,10 +417,7 @@ async fn run_history(
 
 /// Write reconstructed browse paths back into the `[[selection.node]]` entries
 /// of an existing config file, preserving its formatting and comments.
-fn persist_node_paths(
-    path: &std::path::Path,
-    updates: &[(String, String)],
-) -> Result<()> {
+fn persist_node_paths(path: &std::path::Path, updates: &[(String, String)]) -> Result<()> {
     let original = std::fs::read_to_string(path).map_err(|e| ScanError::Config {
         path: path.to_path_buf(),
         reason: e.to_string(),

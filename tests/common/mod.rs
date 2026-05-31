@@ -18,53 +18,111 @@
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+use opcua::crypto::SecurityPolicy;
 use opcua::server::address_space::VariableBuilder;
 use opcua::server::diagnostics::NamespaceMetadata;
 use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
-use opcua::server::{ServerBuilder, ServerEndpoint, ANONYMOUS_USER_TOKEN_ID};
-use opcua::types::{DataTypeId, NodeId};
+use opcua::server::{
+    ServerBuilder, ServerEndpoint, ServerHandle, ServerUserToken, ANONYMOUS_USER_TOKEN_ID,
+};
+use opcua::types::{DataTypeId, MessageSecurityMode, NodeId};
 
 /// Namespace URI used by the test address space.
 pub const TEST_NS: &str = "urn:opcua-scan-test";
 
+/// Key under which the username/password token is registered on the server.
+pub const TEST_USER_TOKEN_ID: &str = "opcua-scan-test-user";
+/// Username accepted by the in-process server.
+pub const TEST_USER: &str = "operator";
+/// Password accepted by the in-process server.
+pub const TEST_PASSWORD: &str = "s3cr3t-pass";
+
+/// Leaf variables created under `Motor`, with their browse names.
+pub const MOTOR_VARIABLES: &[&str] = &[
+    "Temperature",
+    "Speed",
+    "Torque",
+    "Power",
+    "Running",
+    "Label",
+    "Counter",
+    "TempHistory",
+];
+
 /// Start (or locate) a test server and return its endpoint URL.
+///
+/// The in-process server is started **once per test binary** and shared by all
+/// tests in that binary. The address space is read-only, so sharing is safe and
+/// it keeps resource use low: spawning a separate full OPC UA server (with
+/// secure endpoints and crypto handshakes) for every test otherwise starves the
+/// CPU under parallel load and makes timing-sensitive tests flaky.
 ///
 /// If `OPCUA_TEST_ENDPOINT` is set, that endpoint is returned and no in-process
 /// server is started.
 pub fn start() -> String {
-    if let Ok(ep) = std::env::var("OPCUA_TEST_ENDPOINT") {
-        return ep;
-    }
+    use std::sync::OnceLock;
+    static ENDPOINT: OnceLock<String> = OnceLock::new();
+    ENDPOINT
+        .get_or_init(|| {
+            if let Ok(ep) = std::env::var("OPCUA_TEST_ENDPOINT") {
+                return ep;
+            }
 
-    let port = free_port();
-    let endpoint = format!("opc.tcp://127.0.0.1:{port}/");
+            let port = free_port();
+            let endpoint = format!("opc.tcp://127.0.0.1:{port}/");
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-        rt.block_on(async move {
-            run_server(port).await;
-        });
-    });
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("build test runtime");
+                rt.block_on(async move {
+                    run_server(port).await;
+                });
+            });
 
-    wait_until_listening(port);
-    endpoint
+            wait_until_listening(port);
+            endpoint
+        })
+        .clone()
 }
 
 /// Build, populate and run the in-process server until the runtime ends.
 async fn run_server(port: u16) {
     let pki = std::env::temp_dir().join(format!("opcua-scan-test-pki-{port}"));
+    let tokens = [
+        ANONYMOUS_USER_TOKEN_ID.to_string(),
+        TEST_USER_TOKEN_ID.to_string(),
+    ];
     let (server, handle) = ServerBuilder::new()
         .application_name("opcua-scan-test-server")
         .application_uri("urn:opcua-scan-test-server")
         .host("127.0.0.1")
         .port(port)
         .discovery_urls(vec![format!("opc.tcp://127.0.0.1:{port}/")])
+        .add_user_token(
+            TEST_USER_TOKEN_ID,
+            ServerUserToken::user_pass(TEST_USER, TEST_PASSWORD),
+        )
+        .add_endpoint("none", ServerEndpoint::new_none("/", &tokens))
         .add_endpoint(
-            "none",
-            ServerEndpoint::new_none("/", &[ANONYMOUS_USER_TOKEN_ID.to_string()]),
+            "basic256sha256_sign",
+            ServerEndpoint::new(
+                "/",
+                SecurityPolicy::Basic256Sha256,
+                MessageSecurityMode::Sign,
+                &tokens,
+            ),
+        )
+        .add_endpoint(
+            "basic256sha256_signencrypt",
+            ServerEndpoint::new(
+                "/",
+                SecurityPolicy::Basic256Sha256,
+                MessageSecurityMode::SignAndEncrypt,
+                &tokens,
+            ),
         )
         .with_node_manager(simple_node_manager(
             NamespaceMetadata {
@@ -85,7 +143,7 @@ async fn run_server(port: u16) {
 }
 
 /// Populate the address space with the known factory hierarchy.
-fn populate(handle: &opcua::server::ServerHandle) {
+fn populate(handle: &ServerHandle) {
     let nm = handle
         .node_managers()
         .get_of_type::<SimpleNodeManager>()
@@ -104,6 +162,9 @@ fn populate(handle: &opcua::server::ServerHandle) {
     let motor = NodeId::new(ns, "Motor");
     let _ = a.add_folder(&motor, "Motor", "Motor", &line);
 
+    // A spread of scalar data types so type/datatype filtering and value
+    // conversion can be exercised end to end. The eight children also make
+    // Browse continuation points reachable with a small `--page-size`.
     VariableBuilder::new(
         &NodeId::new(ns, "Temperature"),
         "Temperature",
@@ -118,6 +179,43 @@ fn populate(handle: &opcua::server::ServerHandle) {
         .value(1500.0f32)
         .organized_by(&motor)
         .insert(&mut *a);
+    VariableBuilder::new(&NodeId::new(ns, "Torque"), "Torque", "Torque")
+        .data_type(DataTypeId::Double)
+        .value(8.5f64)
+        .organized_by(&motor)
+        .insert(&mut *a);
+    VariableBuilder::new(&NodeId::new(ns, "Power"), "Power", "Power")
+        .data_type(DataTypeId::Double)
+        .value(3200.0f64)
+        .organized_by(&motor)
+        .insert(&mut *a);
+    VariableBuilder::new(&NodeId::new(ns, "Running"), "Running", "Running")
+        .data_type(DataTypeId::Boolean)
+        .value(true)
+        .organized_by(&motor)
+        .insert(&mut *a);
+    VariableBuilder::new(&NodeId::new(ns, "Label"), "Label", "Label")
+        .data_type(DataTypeId::String)
+        .value("M-100")
+        .organized_by(&motor)
+        .insert(&mut *a);
+    VariableBuilder::new(&NodeId::new(ns, "Counter"), "Counter", "Counter")
+        .data_type(DataTypeId::Int32)
+        .value(42i32)
+        .organized_by(&motor)
+        .insert(&mut *a);
+    // A historizing variable so the `--historizing` predicate has a target.
+    VariableBuilder::new(
+        &NodeId::new(ns, "TempHistory"),
+        "TempHistory",
+        "TempHistory",
+    )
+    .data_type(DataTypeId::Double)
+    .value(25.0f64)
+    .historizing(true)
+    .history_readable()
+    .organized_by(&motor)
+    .insert(&mut *a);
 }
 
 /// Grab an unused TCP port by binding to port 0 and reading the assigned port.
@@ -145,12 +243,66 @@ fn wait_until_listening(port: u16) {
 /// A throwaway PKI directory is used so the client keypair does not clutter the
 /// working directory.
 pub fn run_cli(args: &[&str]) -> Output {
-    let pki = std::env::temp_dir().join(format!("opcua-scan-client-pki-{}", std::process::id()));
-    Command::new(env!("CARGO_BIN_EXE_opcua-scan"))
-        .args(args)
+    run_cli_with_env(args, &[])
+}
+
+/// Like [`run_cli`] but with additional environment variables set on the child
+/// process. `RUST_LOG=error` is always applied first (callers can override).
+pub fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    // A PKI directory unique to each invocation, so parallel secure-channel
+    // tests never race on creating/reading the client sample keypair.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pki =
+        std::env::temp_dir().join(format!("opcua-scan-client-pki-{}-{n}", std::process::id()));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_opcua-scan"));
+    cmd.args(args)
         .arg("--pki-dir")
         .arg(&pki)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("run opcua-scan binary")
+        .env("RUST_LOG", "error");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("run opcua-scan binary")
+}
+
+/// Run the CLI and assert it exited successfully, returning stdout as a string.
+///
+/// On failure the assertion message includes both stdout and stderr so test
+/// failures are easy to diagnose.
+pub fn run_cli_ok(args: &[&str]) -> String {
+    let out = run_cli(args);
+    assert!(
+        out.status.success(),
+        "command {args:?} failed with code {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Parse CLI stdout as a JSON array of records, with a helpful panic message.
+pub fn json_records(stdout: &[u8]) -> Vec<serde_json::Value> {
+    let text = String::from_utf8_lossy(stdout);
+    serde_json::from_str::<Vec<serde_json::Value>>(text.trim())
+        .unwrap_or_else(|e| panic!("expected JSON array, got error {e}; output was:\n{text}"))
+}
+
+/// Poll `check` until it returns `Some`, or panic after `timeout`.
+///
+/// This is the preferred way to wait for asynchronous conditions in tests: it
+/// avoids fixed `sleep`s (slow and flaky) in favour of a bounded retry loop
+/// with a short, deterministic poll interval.
+pub fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = check() {
+            return v;
+        }
+        if Instant::now() >= deadline {
+            panic!("condition not met within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }

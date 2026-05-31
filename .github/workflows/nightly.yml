@@ -1,0 +1,78 @@
+name: Nightly Interoperability
+
+# Heavier cross-implementation tests against containerized reference servers.
+# Runs on a schedule and on demand, so pull-request feedback stays fast.
+on:
+  schedule:
+    # 03:17 UTC daily (off-peak, avoids the top-of-hour stampede).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      endpoints:
+        description: >-
+          Optional override for OPCUA_INTEROP_ENDPOINTS
+          (e.g. "opcplc=opc.tcp://127.0.0.1:50000/,node-opcua=opc.tcp://127.0.0.1:4841/")
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  COMPOSE_FILE: tests/interop/docker-compose.yml
+
+jobs:
+  interop:
+    name: Interoperability matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start reference OPC UA servers
+        run: docker compose -f "$COMPOSE_FILE" up -d --build
+
+      - name: Wait for servers to accept connections
+        run: |
+          for hp in 127.0.0.1:50000 127.0.0.1:4841; do
+            host="${hp%%:*}"; port="${hp##*:}"
+            echo "Waiting for $hp ..."
+            for i in $(seq 1 60); do
+              if (exec 3<>/dev/tcp/$host/$port) 2>/dev/null; then
+                echo "$hp is up"; break
+              fi
+              sleep 2
+              if [ "$i" -eq 60 ]; then echo "::warning::$hp did not come up in time"; fi
+            done
+          done
+
+      - name: Build interop test binary
+        run: cargo test --test interop --no-run --locked
+
+      - name: Run interoperability suite
+        env:
+          OPCUA_INTEROP_ENDPOINTS: >-
+            ${{ github.event.inputs.endpoints
+              || 'opcplc=opc.tcp://127.0.0.1:50000/,node-opcua=opc.tcp://127.0.0.1:4841/' }}
+        run: cargo test --test interop --locked -- --ignored --nocapture
+
+      - name: Collect server logs on failure
+        if: always()
+        run: |
+          mkdir -p interop-logs
+          docker compose -f "$COMPOSE_FILE" logs --no-color > interop-logs/compose.log 2>&1 || true
+          docker compose -f "$COMPOSE_FILE" ps > interop-logs/ps.txt 2>&1 || true
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-server-logs
+          path: interop-logs/
+          if-no-files-found: warn
+
+      - name: Tear down servers
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down -v || true

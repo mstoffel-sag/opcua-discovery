@@ -218,7 +218,12 @@ interval = "300ms"
     let line = stdout
         .lines()
         .find(|l| l.contains("Temperature"))
-        .unwrap_or_else(|| panic!("no Temperature measurement emitted:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+        .unwrap_or_else(|| {
+            panic!(
+                "no Temperature measurement emitted:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
     let value: Value = serde_json::from_str(line).expect("valid tedge JSON line");
     assert!(value.get("time").is_some(), "missing time field: {line}");
     // The measurement key is now the full browse path, which ends with the leaf name.
@@ -226,7 +231,10 @@ interval = "300ms"
         .as_object()
         .map(|obj| obj.keys().any(|k| k.ends_with("Temperature")))
         .unwrap_or(false);
-    assert!(has_temperature_key, "missing measurement keyed by browse path: {line}");
+    assert!(
+        has_temperature_key,
+        "missing measurement keyed by browse path: {line}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -287,11 +295,19 @@ interval = "300ms"
     let value: Value = serde_json::from_str(line).expect("valid ndjson line");
 
     // Fixed schema: every top-level key is always present.
-    for key in ["time", "key", "value", "dataType", "nodeId", "units", "status", "meta"] {
-        assert!(value.get(key).is_some(), "missing fixed key '{key}': {line}");
+    for key in [
+        "time", "key", "value", "dataType", "nodeId", "units", "status", "meta",
+    ] {
+        assert!(
+            value.get(key).is_some(),
+            "missing fixed key '{key}': {line}"
+        );
     }
     assert_eq!(
-        value.get("key").and_then(Value::as_str).map(|k| k.ends_with("Temperature")),
+        value
+            .get("key")
+            .and_then(Value::as_str)
+            .map(|k| k.ends_with("Temperature")),
         Some(true),
         "expected key to be the full browse path ending in Temperature: {line}"
     );
@@ -300,7 +316,10 @@ interval = "300ms"
         Some("float64"),
         "expected normalized dataType: {line}"
     );
-    assert!(value.get("meta").map(Value::is_object).unwrap_or(false), "meta not an object: {line}");
+    assert!(
+        value.get("meta").map(Value::is_object).unwrap_or(false),
+        "meta not an object: {line}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

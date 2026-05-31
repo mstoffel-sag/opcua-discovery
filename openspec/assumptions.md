@@ -5,9 +5,12 @@
 > on them.
 
 ## A. Build, CI & packaging
-1. **No CI workflows found** (no `.github/workflows`, no other CI manifest in-repo). **[Assumption]**
-   → Verify how the project is built/tested in CI, if at all.
-2. **No Dockerfile / container manifest** found. Runtime is a bare binary. **[Assumption]**
+1. **CI added** (`.github/workflows/ci.yml` + `nightly.yml`). PR CI runs fmt, clippy
+   (`-D warnings`), the hermetic test matrix (ubuntu/macos stable + ubuntu MSRV 1.80) and
+   coverage; the nightly workflow runs the Docker-based interoperability suite. **[Resolved]**
+2. **Docker for interop only**: `tests/interop/docker-compose.yml` brings up reference
+   servers (Microsoft OPC-PLC, node-opcua; opt-in open62541/Milo/refserver). The product
+   itself still ships as a bare binary — no runtime container. **[Resolved/Assumption]**
 3. **No release/packaging automation** (e.g. cargo-dist, cross) found. Distribution method is
    unverified beyond `cargo build --release`. **[Assumption]**
 4. Release profile (`lto=thin`, `codegen-units=1`, `strip=true`) implies binaries are intended for
@@ -55,9 +58,11 @@
 18. OPC UA library logs are suppressed below `-vvv`. **[Confirmed]**
 
 ## G. Suggested validations / next steps for contributors
-- Add CI (fmt + clippy + test) if not present elsewhere. **[Assumption-driven]**
-- Add tests for: history task end-to-end, security `Sign`/`SignAndEncrypt` handshakes, profile merge
-  precedence, `--config-dir` multi-config behavior, and CSV/ndjson schema stability.
+- ~~Add CI (fmt + clippy + test) if not present elsewhere.~~ **[Done — see §A]**
+- ~~Add tests for: history task end-to-end, security `Sign`/`SignAndEncrypt` handshakes, profile merge
+  precedence, `--config-dir` multi-config behavior, and CSV/ndjson schema stability.~~ Covered by
+  `tests/security.rs`, `tests/services.rs` and the new unit suites; full HistoryRead end-to-end is
+  exercised via interop (the in-process fixture's node manager does not serve HistoryRead). **[Mostly done]**
 - Document the exact thin-edge.io downstream pipeline (the missing link between this binary's stdout
   and the cloud).
 - Consider exposing subscription keep-alive/lifetime counts and history pagination size via config.
@@ -67,3 +72,5 @@
 - stdout-is-data / stderr-is-logs separation. **[Confirmed]**
 - Bounded-concurrency, continuation-point, cycle-safe traversal. **[Confirmed]**
 - In-process test server fixture with a known address space. **[Confirmed]**
+- Hermetic test suite (unit + in-process integration) plus an opt-in cross-implementation
+  interoperability suite and GitHub Actions CI. See `docs/TESTING.md`. **[Confirmed]**

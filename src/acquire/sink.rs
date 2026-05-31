@@ -155,11 +155,15 @@ impl Sink {
                 self.write_line(&mut state, &obj)
             }
             OutputFormat::Json => {
-                state.buffer.push(sample_object(sample, self.metadata, false));
+                state
+                    .buffer
+                    .push(sample_object(sample, self.metadata, false));
                 Ok(())
             }
             OutputFormat::Csv => {
-                state.buffer.push(sample_object(sample, self.metadata, true));
+                state
+                    .buffer
+                    .push(sample_object(sample, self.metadata, true));
                 Ok(())
             }
         }
@@ -167,8 +171,7 @@ impl Sink {
 
     /// Emit a structural node record (scan task).
     pub fn emit_record(&self, record: &NodeRecord) -> Result<()> {
-        let value =
-            serde_json::to_value(record).map_err(|e| ScanError::Export(e.to_string()))?;
+        let value = serde_json::to_value(record).map_err(|e| ScanError::Export(e.to_string()))?;
         let mut state = self.lock();
         match self.format {
             OutputFormat::Tedge | OutputFormat::Ndjson => self.write_line(&mut state, &value),

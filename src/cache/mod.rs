@@ -81,3 +81,77 @@ fn sanitize(endpoint: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("create temp dir")
+    }
+
+    #[test]
+    fn store_then_load_round_trips() {
+        let dir = temp_dir();
+        let cache = Cache::open(dir.path());
+        let endpoint = "opc.tcp://host:4840/";
+        let uris = vec![
+            "http://opcfoundation.org/UA/".to_string(),
+            "urn:vendor:custom".to_string(),
+        ];
+        cache.store_namespaces(endpoint, &uris);
+        assert_eq!(cache.load_namespaces(endpoint), Some(uris));
+    }
+
+    #[test]
+    fn missing_entry_returns_none() {
+        let dir = temp_dir();
+        let cache = Cache::open(dir.path());
+        assert_eq!(cache.load_namespaces("opc.tcp://absent/"), None);
+    }
+
+    #[test]
+    fn corrupt_cache_file_is_ignored_not_fatal() {
+        let dir = temp_dir();
+        let cache = Cache::open(dir.path());
+        let endpoint = "opc.tcp://host:4840/";
+        // Write a corrupt file at the expected path.
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(cache.namespaces_path(endpoint), b"{ not valid json").unwrap();
+        assert_eq!(cache.load_namespaces(endpoint), None);
+    }
+
+    #[test]
+    fn endpoint_mismatch_in_payload_is_rejected() {
+        // Two endpoints that sanitize to *different* stems but we deliberately
+        // store one payload and read with a mismatched endpoint string by
+        // hand-writing the file, to exercise the collision-safety check.
+        let dir = temp_dir();
+        let cache = Cache::open(dir.path());
+        let endpoint = "opc.tcp://host:4840/";
+        std::fs::create_dir_all(dir.path()).unwrap();
+        let payload = serde_json::json!({
+            "endpoint": "opc.tcp://other:4840/",
+            "uris": ["http://opcfoundation.org/UA/"]
+        });
+        std::fs::write(
+            cache.namespaces_path(endpoint),
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache.load_namespaces(endpoint), None);
+    }
+
+    #[test]
+    fn store_is_non_fatal_when_dir_unwritable() {
+        // Pointing the cache at a path whose parent is a file makes directory
+        // creation fail; store must swallow the error rather than panic.
+        let dir = temp_dir();
+        let file_path = dir.path().join("a-file");
+        std::fs::write(&file_path, b"x").unwrap();
+        let cache = Cache::open(&file_path.join("nested"));
+        cache.store_namespaces("opc.tcp://host/", &["u".to_string()]);
+        // Nothing to assert beyond "did not panic"; load returns None.
+        assert_eq!(cache.load_namespaces("opc.tcp://host/"), None);
+    }
+}

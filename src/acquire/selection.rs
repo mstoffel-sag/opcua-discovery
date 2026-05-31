@@ -244,8 +244,8 @@ pub(crate) fn remap_node_id(
     ns_uri: Option<&str>,
     namespaces: &NamespaceTable,
 ) -> Result<NodeId> {
-    let parsed =
-        NodeId::from_str(id).map_err(|_| ScanError::InvalidArgument(format!("invalid node id '{id}'")))?;
+    let parsed = NodeId::from_str(id)
+        .map_err(|_| ScanError::InvalidArgument(format!("invalid node id '{id}'")))?;
     match ns_uri {
         Some(uri) if !uri.is_empty() => {
             let index = namespaces.index(uri).ok_or_else(|| {
@@ -301,10 +301,7 @@ async fn resolve_filtered(
         match NodeId::from_str(&record.node_id) {
             Ok(node_id) => {
                 let meta = SampleMeta {
-                    data_type: data_type_string(
-                        record.datatype.as_deref(),
-                        record.value_rank,
-                    ),
+                    data_type: data_type_string(record.datatype.as_deref(), record.value_rank),
                     engineering_units: None,
                     browse_name: non_empty(&record.browse_name),
                     display_name: non_empty(&record.display_name),

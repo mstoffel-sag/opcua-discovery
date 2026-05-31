@@ -30,9 +30,9 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
-use crate::cli::Encoding;
 use crate::acquire::config::NodeMode;
 use crate::acquire::generate::GenMode;
+use crate::cli::Encoding;
 use crate::error::{Result, ScanError};
 use crate::export::{write_export, NodeRecord};
 use crate::filters::{is_subscribable, FilterSet};
@@ -504,11 +504,7 @@ impl App {
 
         // Park the cursor on the first revealed selection for convenience.
         self.rebuild_visible();
-        if let Some(pos) = self
-            .visible
-            .iter()
-            .position(|&idx| self.arena[idx].marked)
-        {
+        if let Some(pos) = self.visible.iter().position(|&idx| self.arena[idx].marked) {
             self.selected = pos;
             self.list_state.select(Some(pos));
         }
@@ -536,7 +532,12 @@ impl App {
         tokio::spawn(async move {
             let result =
                 browse_into_children(&session, &filters, &parent_id, &parent_path, page_size).await;
-            let _ = tx.send(JobMsg::BrowseDone { parent: idx, result }).await;
+            let _ = tx
+                .send(JobMsg::BrowseDone {
+                    parent: idx,
+                    result,
+                })
+                .await;
         });
     }
 
@@ -1028,7 +1029,11 @@ impl App {
                 return;
             }
             self.status = match write_export(&mut records, encoding, Some(&path)) {
-                Ok(()) => format!("exported {} loaded nodes to {}", records.len(), path.display()),
+                Ok(()) => format!(
+                    "exported {} loaded nodes to {}",
+                    records.len(),
+                    path.display()
+                ),
                 Err(e) => format!("export failed: {e}"),
             };
             return;
@@ -1320,7 +1325,10 @@ impl App {
         let ratio = ((self.spinner % 20) as f64) / 19.0;
         let ratio = if ratio > 1.0 { 2.0 - ratio } else { ratio };
         let label = if job.counted {
-            format!("{spinner} {} · {} nodes · x to cancel", job.verb, job.processed)
+            format!(
+                "{spinner} {} · {} nodes · x to cancel",
+                job.verb, job.processed
+            )
         } else {
             format!("{spinner} {}…", job.verb)
         };
@@ -1663,10 +1671,7 @@ async fn collect_job(
     use std::sync::atomic::Ordering;
 
     // Build a GenNode from a discovered record, capturing the namespace URI.
-    fn to_gennode(
-        record: &NodeRecord,
-        mode: Option<GenMode>,
-    ) -> crate::acquire::generate::GenNode {
+    fn to_gennode(record: &NodeRecord, mode: Option<GenMode>) -> crate::acquire::generate::GenNode {
         crate::acquire::generate::GenNode {
             id: record.node_id.clone(),
             namespace: Some(record.namespace_uri.clone()).filter(|s| !s.is_empty()),
@@ -1730,9 +1735,7 @@ async fn collect_job(
         let _ = handle.await;
     }
 
-    let _ = tx
-        .send(JobMsg::CollectDone { result: Ok(nodes) })
-        .await;
+    let _ = tx.send(JobMsg::CollectDone { result: Ok(nodes) }).await;
 }
 
 /// Map a per-node [`NodeMode`] to a [`GenMode`] for config generation; `Auto`

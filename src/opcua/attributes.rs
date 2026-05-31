@@ -210,3 +210,87 @@ fn node_class_from_i32(n: i32) -> Option<NodeClass> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variable(access: Option<u8>) -> NodeAttributes {
+        NodeAttributes {
+            node_class: Some(NodeClass::Variable),
+            access_level: access,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn readable_and_writable_track_access_level_bits() {
+        let ro = variable(Some(access::CURRENT_READ));
+        assert!(ro.is_readable());
+        assert!(!ro.is_writable());
+
+        let rw = variable(Some(access::CURRENT_READ | access::CURRENT_WRITE));
+        assert!(rw.is_readable());
+        assert!(rw.is_writable());
+
+        let wo = variable(Some(access::CURRENT_WRITE));
+        assert!(!wo.is_readable());
+        assert!(wo.is_writable());
+    }
+
+    #[test]
+    fn unknown_access_level_is_treated_as_not_readable() {
+        // No evidence either way -> not readable/writable, but also NOT flagged
+        // as an unreadable variable (we only exclude on explicit evidence).
+        let unknown = variable(None);
+        assert!(!unknown.is_readable());
+        assert!(!unknown.is_writable());
+        assert!(!unknown.is_unreadable_variable());
+    }
+
+    #[test]
+    fn unreadable_variable_requires_explicit_no_read_bit() {
+        // A Variable whose AccessLevel is present but lacks CurrentRead.
+        let no_read = variable(Some(access::CURRENT_WRITE));
+        assert!(no_read.is_unreadable_variable());
+
+        // A readable variable is not "unreadable".
+        let readable = variable(Some(access::CURRENT_READ));
+        assert!(!readable.is_unreadable_variable());
+
+        // Non-variables are never flagged regardless of access level.
+        let object = NodeAttributes {
+            node_class: Some(NodeClass::Object),
+            access_level: Some(0),
+            ..Default::default()
+        };
+        assert!(!object.is_unreadable_variable());
+    }
+
+    #[test]
+    fn historizing_defaults_to_false_when_unknown() {
+        let attrs = NodeAttributes::default();
+        assert!(!attrs.is_historizing());
+        let hist = NodeAttributes {
+            historizing: Some(true),
+            ..Default::default()
+        };
+        assert!(hist.is_historizing());
+    }
+
+    #[test]
+    fn node_class_from_i32_maps_known_bits_only() {
+        assert_eq!(node_class_from_i32(2), Some(NodeClass::Variable));
+        assert_eq!(node_class_from_i32(128), Some(NodeClass::View));
+        assert_eq!(node_class_from_i32(0), None);
+        assert_eq!(node_class_from_i32(3), None);
+    }
+
+    #[test]
+    fn as_u8_accepts_common_integer_variants() {
+        assert_eq!(as_u8(&Variant::Byte(5)), Some(5));
+        assert_eq!(as_u8(&Variant::Int32(1)), Some(1));
+        assert_eq!(as_u8(&Variant::UInt16(3)), Some(3));
+        assert_eq!(as_u8(&Variant::Boolean(true)), None);
+    }
+}
