@@ -35,10 +35,32 @@ pub struct BrowseArgs {
     /// Validate that subscribable nodes can actually be monitored.
     #[arg(long)]
     pub validate_subscription: bool,
+
+    /// Reuse an existing `acquire` config: its `[connection]` supplies defaults
+    /// and its `selection.node_ids` are pre-marked in the TUI. Saving (the `a`
+    /// action) updates this file in place. CLI flags override config values.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<std::path::PathBuf>,
+
+    /// In the TUI, write the generated/updated `acquire` config to this file.
+    /// Defaults to `--config` (when given) or `acquire.toml`.
+    #[arg(long, value_name = "FILE")]
+    pub acquire_out: Option<std::path::PathBuf>,
 }
 
 /// Run the `browse` command.
-pub async fn run(args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
+pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
+    // Optionally seed from an existing acquire config: reuse its connection and
+    // pre-select its nodes in the TUI. CLI flags take precedence.
+    let mut acquire_cfg: Option<crate::acquire::config::AcquireConfig> = None;
+    let mut source_config: Option<std::path::PathBuf> = None;
+    if let Some(path) = args.config.clone() {
+        let cfg = crate::acquire::config::AcquireConfig::from_file(&path)?;
+        cfg.connection.apply_to(&mut args.connection)?;
+        acquire_cfg = Some(cfg);
+        source_config = Some(path);
+    }
+
     let conn = Connection::connect(&args.connection).await?;
     let session = conn.session().clone();
 
@@ -47,8 +69,32 @@ pub async fn run(args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
     let filters = Arc::new(FilterSet::compile(&args.filters, &namespaces)?);
     let root = resolve_root(&args.traversal.root)?;
 
+    // Resolve the saved selection to live node ids now that namespaces are
+    // known: each saved node's namespace URI is remapped to the server's
+    // current index so pre-marking matches the live tree even if the server
+    // reordered its namespace array.
+    let mut selected_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(cfg) = &acquire_cfg {
+        for node in &cfg.selection.nodes {
+            let id = crate::acquire::selection::remap_node_id(
+                &node.id,
+                node.namespace.as_deref(),
+                &namespaces,
+            )?;
+            selected_ids.insert(id.to_string());
+        }
+        // Legacy bare ids carry no URI: use them verbatim.
+        selected_ids.extend(cfg.selection.node_ids.iter().cloned());
+    }
+
     // Interactive explorer: opt-in, replaces streaming/export output entirely.
     if args.output.tui {
+        // Write target: --acquire-out, else the source --config, else default.
+        let acquire_file = args
+            .acquire_out
+            .clone()
+            .or_else(|| source_config.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("acquire.toml"));
         let options = crate::tui::TuiOptions {
             root,
             page_size: args.traversal.page_size,
@@ -58,6 +104,10 @@ pub async fn run(args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
             max_children: args.traversal.max_children,
             retry: args.connection.retry,
             preview_values: args.output.preview_values,
+            connection: gen_connection(&args.connection, conn.endpoint()),
+            acquire_file,
+            selected_ids,
+            source_config,
         };
         let result = crate::tui::run(session, namespaces, filters, options).await;
         conn.disconnect().await;
@@ -110,6 +160,36 @@ pub async fn run(args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
 async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
     while !cancel.load(std::sync::atomic::Ordering::Relaxed) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Build a connection summary for generating an `acquire` config from the TUI.
+/// The password is intentionally never captured.
+fn gen_connection(
+    args: &ConnectionArgs,
+    endpoint: &str,
+) -> crate::acquire::generate::GenConnection {
+    use crate::cli::{SecurityModeArg, SecurityPolicyArg};
+
+    let security_policy = match args.security_policy {
+        SecurityPolicyArg::None => None,
+        SecurityPolicyArg::Basic256Sha256 => Some("Basic256Sha256".to_string()),
+        SecurityPolicyArg::Aes128Sha256RsaOaep => Some("Aes128Sha256RsaOaep".to_string()),
+        SecurityPolicyArg::Aes256Sha256RsaPss => Some("Aes256Sha256RsaPss".to_string()),
+    };
+    let security_mode = match args.security_mode {
+        SecurityModeArg::None => None,
+        SecurityModeArg::Sign => Some("Sign".to_string()),
+        SecurityModeArg::SignAndEncrypt => Some("SignAndEncrypt".to_string()),
+    };
+
+    crate::acquire::generate::GenConnection {
+        endpoint: endpoint.to_string(),
+        trust_server: args.trust_server,
+        security_policy,
+        security_mode,
+        user: args.user.clone(),
+        pki_dir: args.pki_dir.clone(),
     }
 }
 

@@ -58,6 +58,11 @@ enum JobMsg {
         result: std::result::Result<usize, String>,
         path: PathBuf,
     },
+    /// A background collection of variable nodes (for an acquire config)
+    /// finished.
+    CollectDone {
+        result: std::result::Result<Vec<crate::acquire::generate::GenNode>, String>,
+    },
 }
 
 /// A child node produced by a background browse job, ready to insert.
@@ -94,6 +99,16 @@ pub struct TuiOptions {
     pub max_children: Option<usize>,
     pub retry: u32,
     pub preview_values: bool,
+    /// Connection summary used to generate an `acquire` config (the `a` action).
+    pub connection: crate::acquire::generate::GenConnection,
+    /// Destination for a generated `acquire` config (the `a` action).
+    pub acquire_file: PathBuf,
+    /// Node ids pre-selected from a loaded `acquire` config; these are marked in
+    /// the tree as they are encountered while browsing.
+    pub selected_ids: std::collections::HashSet<String>,
+    /// When set, the `a` action edits this existing config in place (updating
+    /// only the selection) instead of generating a fresh file with a prompt.
+    pub source_config: Option<PathBuf>,
 }
 
 /// Run the interactive explorer until the user quits.
@@ -237,6 +252,12 @@ struct App {
     status: String,
     filter_query: String,
     filter_mode: bool,
+    /// When true, an acquire-config prompt is capturing "<mode> <interval>".
+    acquire_mode: bool,
+    /// Current text of the acquire-config prompt.
+    acquire_query: String,
+    /// Chosen mode + interval awaiting a background node collection to finish.
+    acquire_pending: Option<(crate::acquire::generate::GenMode, Duration)>,
     /// When true, hide nodes that don't lead to Variables (declutter view).
     vars_only: bool,
     /// In-progress background job state (for the progress bar), if any.
@@ -247,6 +268,8 @@ struct App {
     pending_job: Option<mpsc::Receiver<JobMsg>>,
     /// Spinner animation frame counter.
     spinner: usize,
+    /// Number of pre-selected nodes (from a loaded config) located so far.
+    located: usize,
     quit: bool,
 }
 
@@ -257,6 +280,15 @@ impl App {
         filters: Arc<FilterSet>,
         options: TuiOptions,
     ) -> Self {
+        let status = if let Some(path) = &options.source_config {
+            format!(
+                "editing {} · selection 0/{} located · ↑/↓ move · space mark · a save · q quit",
+                path.display(),
+                options.selected_ids.len()
+            )
+        } else {
+            "↑/↓ move · →/← expand · space mark · V vars-only · v value · s validate · e export · a acquire · / filter · q quit".into()
+        };
         Self {
             session,
             namespaces,
@@ -267,14 +299,18 @@ impl App {
             visible: Vec::new(),
             selected: 0,
             list_state: ListState::default(),
-            status: "↑/↓ move · →/← expand · space mark · V vars-only · v value · s validate · e export · / filter · q quit".into(),
+            status,
             filter_query: String::new(),
             filter_mode: false,
+            acquire_mode: false,
+            acquire_query: String::new(),
+            acquire_pending: None,
             vars_only: false,
             job: None,
             job_cancel: None,
             pending_job: None,
             spinner: 0,
+            located: 0,
             quit: false,
         }
     }
@@ -286,6 +322,7 @@ impl App {
             .read_label(&root_id)
             .await
             .unwrap_or_else(|| "Root".into());
+        let marked = self.options.selected_ids.contains(&root_id.to_string());
         let root = Node {
             node_id: root_id,
             label,
@@ -298,12 +335,15 @@ impl App {
             expanded: true,
             expandable: true,
             loading: false,
-            marked: false,
+            marked,
             attrs: None,
             value: None,
         };
         self.arena.push(root);
         self.roots.push(0);
+        if marked {
+            self.note_located();
+        }
         self.load_children(0).await;
         self.rebuild_visible();
     }
@@ -352,7 +392,15 @@ impl App {
     fn attach_children(&mut self, parent_idx: usize, children: Vec<LoadedChild>) {
         let parent_depth = self.arena[parent_idx].depth;
         let mut child_indices = Vec::with_capacity(children.len());
+        let mut newly_located = 0;
         for child in children {
+            let marked = self
+                .options
+                .selected_ids
+                .contains(&child.node_id.to_string());
+            if marked {
+                newly_located += 1;
+            }
             let node = Node {
                 node_id: child.node_id,
                 label: child.label,
@@ -365,7 +413,7 @@ impl App {
                 expanded: false,
                 expandable: child.expandable,
                 loading: false,
-                marked: false,
+                marked,
                 attrs: child.attrs,
                 value: None,
             };
@@ -376,6 +424,23 @@ impl App {
         self.arena[parent_idx].children = child_indices;
         self.arena[parent_idx].loaded = true;
         self.arena[parent_idx].loading = false;
+        for _ in 0..newly_located {
+            self.note_located();
+        }
+    }
+
+    /// Record that a pre-selected node was found in the tree and refresh the
+    /// "M/N located" status line when editing a loaded config.
+    fn note_located(&mut self) {
+        self.located += 1;
+        if let Some(path) = &self.options.source_config {
+            self.status = format!(
+                "editing {} · selection {}/{} located · space mark · a save · q quit",
+                path.display(),
+                self.located,
+                self.options.selected_ids.len()
+            );
+        }
     }
 
     /// Spawn a background browse so the UI stays responsive on slow servers or
@@ -458,6 +523,10 @@ impl App {
             self.handle_filter_key(key);
             return Ok(());
         }
+        if self.acquire_mode {
+            self.handle_acquire_key(key);
+            return Ok(());
+        }
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -481,6 +550,19 @@ impl App {
             KeyCode::Char('v') => self.preview_value().await,
             KeyCode::Char('s') => self.validate_selected().await,
             KeyCode::Char('e') => self.export(),
+            KeyCode::Char('a') => {
+                if self.options.source_config.is_some() {
+                    // Editing an existing config: update its selection directly,
+                    // no mode/interval prompt (the tasks are preserved as-is).
+                    self.start_acquire("poll 1s");
+                } else {
+                    self.acquire_mode = true;
+                    self.acquire_query = "poll 1s".into();
+                    self.status =
+                        "acquire: '<poll|subscribe> <interval>' (Enter write config, Esc cancel)"
+                            .into();
+                }
+            }
             KeyCode::Char('x') => self.cancel_job(),
             KeyCode::Char('/') => {
                 self.filter_mode = true;
@@ -512,6 +594,28 @@ impl App {
             KeyCode::Char(c) => {
                 self.filter_query.push(c);
                 self.rebuild_visible();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_acquire_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.acquire_mode = false;
+                self.acquire_query.clear();
+                self.status = "acquire cancelled".into();
+            }
+            KeyCode::Enter => {
+                self.acquire_mode = false;
+                let query = std::mem::take(&mut self.acquire_query);
+                self.start_acquire(&query);
+            }
+            KeyCode::Backspace => {
+                self.acquire_query.pop();
+            }
+            KeyCode::Char(c) => {
+                self.acquire_query.push(c);
             }
             _ => {}
         }
@@ -594,6 +698,25 @@ impl App {
                 };
                 self.job = None;
                 self.job_cancel = None;
+                true
+            }
+            JobMsg::CollectDone { result } => {
+                self.job = None;
+                self.job_cancel = None;
+                let pending = self.acquire_pending.take();
+                match (result, pending) {
+                    (Ok(nodes), Some((mode, interval))) => {
+                        if nodes.is_empty() {
+                            self.status = "no variables found in the marked selection".into();
+                        } else {
+                            self.write_acquire_config(nodes, mode, interval);
+                        }
+                    }
+                    (Ok(_), None) => {
+                        self.status = "acquire: internal error (no pending mode)".into();
+                    }
+                    (Err(e), _) => self.status = format!("acquire collect failed: {e}"),
+                }
                 true
             }
         }
@@ -840,6 +963,140 @@ impl App {
         }
     }
 
+    /// Parse the acquire prompt ("<poll|subscribe> <interval>"), collect the
+    /// selected Variable node ids, and write an `acquire` config. Marked
+    /// subtrees are traversed in the background; with nothing marked, the
+    /// already-loaded Variables are used immediately.
+    fn start_acquire(&mut self, query: &str) {
+        if self.job.is_some() {
+            self.status = "busy — please wait for the current operation".into();
+            return;
+        }
+
+        let (mode, interval) = match parse_acquire_query(query) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status = format!("acquire: {e}");
+                return;
+            }
+        };
+
+        // Top-level marked subtrees (a mark covers the whole subtree).
+        let marked_roots: Vec<usize> = self
+            .arena
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.marked && n.parent.is_some() && !self.ancestor_marked(*i))
+            .map(|(i, _)| i)
+            .collect();
+
+        if marked_roots.is_empty() {
+            // Nothing marked: use the Variables already loaded in memory.
+            let nodes: Vec<crate::acquire::generate::GenNode> = self
+                .arena
+                .iter()
+                .filter(|n| n.parent.is_some() && n.class == NodeClass::Variable)
+                .map(|n| self.node_to_gennode(n))
+                .collect();
+            if nodes.is_empty() {
+                self.status =
+                    "no variables marked or loaded — mark nodes with space, then press a".into();
+                return;
+            }
+            self.write_acquire_config(nodes, mode, interval);
+            return;
+        }
+
+        // Traverse each marked subtree in the background to collect Variables.
+        let roots: Vec<ExportRoot> = marked_roots
+            .iter()
+            .map(|&idx| ExportRoot {
+                node_id: self.arena[idx].node_id.clone(),
+                path: self.arena[idx].path.clone(),
+                record: self.node_to_record(&self.arena[idx]),
+            })
+            .collect();
+
+        let session = self.session.clone();
+        let filters = self.filters.clone();
+        let namespaces = self.namespaces.clone();
+        let tmpl = ExportTemplate {
+            strategy: self.options.strategy,
+            workers: self.options.workers,
+            page_size: self.options.page_size,
+            max_children: self.options.max_children,
+            retry: self.options.retry,
+            preview_values: false,
+        };
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(16);
+
+        self.acquire_pending = Some((mode, interval));
+        self.job = Some(JobState {
+            verb: format!("Collecting variables from {} subtree(s)", roots.len()),
+            processed: 0,
+            counted: true,
+        });
+        self.job_cancel = Some(cancel.clone());
+        self.pending_job = Some(rx);
+        self.status = "collecting variables in background… (x to cancel)".into();
+
+        tokio::spawn(async move {
+            collect_job(session, filters, namespaces, roots, tmpl, cancel, tx).await;
+        });
+    }
+
+    /// Generate and write the acquire config to the configured path.
+    fn write_acquire_config(
+        &mut self,
+        nodes: Vec<crate::acquire::generate::GenNode>,
+        mode: crate::acquire::generate::GenMode,
+        interval: Duration,
+    ) {
+        let path = self.options.acquire_file.clone();
+        let count = nodes.len();
+
+        // Editing an existing config: update only the selection in place,
+        // preserving connection, tasks, output, comments and formatting.
+        if let Some(src) = self.options.source_config.clone() {
+            match std::fs::read_to_string(&src) {
+                Ok(original) => {
+                    match crate::acquire::generate::update_selection_in_toml(&original, &nodes) {
+                        Ok(updated) => match std::fs::write(&path, updated) {
+                            Ok(()) => {
+                                self.status =
+                                    format!("updated selection ({count}) in {}", path.display());
+                            }
+                            Err(e) => self.status = format!("acquire write failed: {e}"),
+                        },
+                        Err(e) => self.status = format!("acquire update failed: {e}"),
+                    }
+                }
+                Err(e) => self.status = format!("acquire read failed: {e}"),
+            }
+            return;
+        }
+
+        match crate::acquire::generate::generate_toml(
+            &self.options.connection,
+            nodes,
+            mode,
+            interval,
+        ) {
+            Ok(toml) => match std::fs::write(&path, toml) {
+                Ok(()) => {
+                    self.status = format!(
+                        "wrote {count} node(s) to {} — run: opcua-scan acquire --config {}",
+                        path.display(),
+                        path.display()
+                    );
+                }
+                Err(e) => self.status = format!("acquire write failed: {e}"),
+            },
+            Err(e) => self.status = format!("acquire config failed: {e}"),
+        }
+    }
+
     fn node_to_record(&self, node: &Node) -> NodeRecord {
         let attrs = node.attrs.clone().unwrap_or_default();
         let datatype = attrs.data_type.as_ref().map(|dt| {
@@ -867,6 +1124,27 @@ impl App {
             current_value: node.value.clone(),
             engineering_units: None,
             description: attrs.description.clone(),
+        }
+    }
+
+    /// Build a [`GenNode`] (for an acquire config) from a tree node, capturing
+    /// the namespace URI so the id can be remapped if the server later reorders
+    /// its namespace array.
+    fn node_to_gennode(&self, node: &Node) -> crate::acquire::generate::GenNode {
+        let namespace = match self.namespaces.uri(node.node_id.namespace) {
+            Some(uri) if node.node_id.namespace != 0 && !uri.is_empty() => Some(uri.to_string()),
+            _ => None,
+        };
+        let name = node
+            .attrs
+            .as_ref()
+            .and_then(|a| a.display_name.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(node.label.clone()).filter(|s| !s.is_empty()));
+        crate::acquire::generate::GenNode {
+            id: node.node_id.to_string(),
+            namespace,
+            name,
         }
     }
 
@@ -1048,6 +1326,8 @@ impl App {
     fn render_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         let text = if self.filter_mode {
             format!("/{}", self.filter_query)
+        } else if self.acquire_mode {
+            format!("acquire> {}", self.acquire_query)
         } else {
             self.status.clone()
         };
@@ -1218,6 +1498,105 @@ async fn export_job(
         .map(|()| records.len())
         .map_err(|e| e.to_string());
     let _ = tx.send(JobMsg::ExportDone { result, path }).await;
+}
+
+/// Background collection: run a concurrent scan over each marked subtree and
+/// gather the node ids of all Variable nodes (de-duplicated) for an acquire
+/// config. Mirrors [`export_job`] but yields node ids instead of writing.
+async fn collect_job(
+    session: Arc<Session>,
+    filters: Arc<FilterSet>,
+    namespaces: Arc<NamespaceTable>,
+    roots: Vec<ExportRoot>,
+    tmpl: ExportTemplate,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    tx: mpsc::Sender<JobMsg>,
+) {
+    use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
+
+    // Build a GenNode from a discovered record, capturing the namespace URI.
+    fn to_gennode(record: &NodeRecord) -> crate::acquire::generate::GenNode {
+        crate::acquire::generate::GenNode {
+            id: record.node_id.clone(),
+            namespace: Some(record.namespace_uri.clone()).filter(|s| !s.is_empty()),
+            name: Some(record.display_name.clone()).filter(|s| !s.is_empty()),
+        }
+    }
+
+    let mut nodes: Vec<crate::acquire::generate::GenNode> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut processed = 0usize;
+
+    for root in roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Include the marked node itself if it is a Variable.
+        if root.record.node_class == "Variable" && seen.insert(root.record.node_id.clone()) {
+            nodes.push(to_gennode(&root.record));
+        }
+
+        let config = Arc::new(crate::scanner::ScanConfig {
+            root: root.node_id.clone(),
+            depth: crate::cli::Depth::Unlimited,
+            strategy: tmpl.strategy,
+            workers: tmpl.workers,
+            page_size: tmpl.page_size,
+            max_children: tmpl.max_children,
+            retry: tmpl.retry,
+            preview_values: false,
+        });
+        let engine = crate::scanner::Engine::new(
+            session.clone(),
+            config,
+            filters.clone(),
+            namespaces.clone(),
+            cancel.clone(),
+        );
+
+        let (rtx, mut rrx) = mpsc::channel::<NodeRecord>(1024);
+        let handle = tokio::spawn(async move { engine.run(rtx).await });
+
+        while let Some(record) = rrx.recv().await {
+            processed += 1;
+            if record.node_class == "Variable" && seen.insert(record.node_id.clone()) {
+                nodes.push(to_gennode(&record));
+            }
+            if processed % 64 == 0 {
+                let _ = tx.send(JobMsg::Progress { processed }).await;
+            }
+        }
+        let _ = handle.await;
+    }
+
+    let _ = tx
+        .send(JobMsg::CollectDone { result: Ok(nodes) })
+        .await;
+}
+
+/// Parse an acquire prompt of the form `<poll|subscribe> <interval>` (interval
+/// defaults to 1s when omitted).
+fn parse_acquire_query(
+    query: &str,
+) -> std::result::Result<(crate::acquire::generate::GenMode, Duration), String> {
+    use crate::acquire::generate::GenMode;
+
+    let mut parts = query.split_whitespace();
+    let mode = match parts.next() {
+        Some(m) if m.eq_ignore_ascii_case("poll") => GenMode::Poll,
+        Some(m) if m.eq_ignore_ascii_case("subscribe") || m.eq_ignore_ascii_case("sub") => {
+            GenMode::Subscribe
+        }
+        Some(other) => return Err(format!("unknown mode '{other}' (use poll or subscribe)")),
+        None => return Err("expected '<poll|subscribe> <interval>'".to_string()),
+    };
+    let interval = match parts.next() {
+        Some(s) => humantime::parse_duration(s).map_err(|e| format!("invalid interval: {e}"))?,
+        None => Duration::from_secs(1),
+    };
+    Ok((mode, interval))
 }
 
 /// A node class likely to have hierarchical children worth expanding.

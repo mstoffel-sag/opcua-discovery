@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+pub mod acquire;
 pub mod browse;
 pub mod connect;
 pub mod sample;
@@ -76,6 +77,8 @@ pub enum Command {
     Search(search::SearchArgs),
     /// Subscribe to matching variables and print live value updates.
     Sample(sample::SampleArgs),
+    /// Run config-driven data acquisition (scan, poll, subscribe, history).
+    Acquire(acquire::AcquireArgs),
 }
 
 /// Connection, security and authentication arguments.

@@ -8,6 +8,7 @@
 pub mod attributes;
 pub mod browse;
 pub mod client;
+pub mod history;
 pub mod namespaces;
 pub mod value;
 

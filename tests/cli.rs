@@ -170,3 +170,58 @@ fn invalid_endpoint_exits_with_usage_code() {
     // Exit code 2 == invalid usage / arguments.
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn acquire_poll_emits_tedge_measurements() {
+    let endpoint = common::start();
+    let dir = std::env::temp_dir().join(format!("opcua-scan-acquire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pki = dir.join("pki");
+    let config_path = dir.join("acquire.toml");
+    let config = format!(
+        r#"
+[connection]
+endpoint = "{endpoint}"
+trust_server = true
+pki_dir = "{pki}"
+
+[selection]
+root = "i=85"
+depth = "unlimited"
+include = ["**/Temperature"]
+node_class = ["Variable"]
+
+[output]
+format = "tedge"
+
+[[task]]
+mode = "poll"
+interval = "300ms"
+"#,
+        pki = pki.to_str().unwrap()
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_opcua-scan"))
+        .args([
+            "acquire",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--duration",
+            "1500ms",
+        ])
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run acquire");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("Temperature"))
+        .unwrap_or_else(|| panic!("no Temperature measurement emitted:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+    let value: Value = serde_json::from_str(line).expect("valid tedge JSON line");
+    assert!(value.get("time").is_some(), "missing time field: {line}");
+    assert!(value.get("Temperature").is_some(), "missing measurement: {line}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

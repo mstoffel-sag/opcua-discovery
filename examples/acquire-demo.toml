@@ -1,0 +1,21 @@
+# Example acquisition config for the public OPC UA demo server.
+# Run:  opcua-scan acquire --config examples/acquire-demo.toml --duration 3s
+
+[connection]
+endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer"
+trust_server = true
+
+[selection]
+# Server_ServerStatus_CurrentTime updates every second on the demo server.
+node_ids = ["i=2258"]
+
+[output]
+format = "tedge"
+
+[[task]]
+mode = "poll"
+interval = "1s"
+
+# [[task]]
+# mode = "subscribe"
+# publishing_interval = "500ms"

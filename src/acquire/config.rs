@@ -1,0 +1,524 @@
+//! TOML configuration schema for the `acquire` command.
+//!
+//! A single config file describes one acquisition run: how to connect, which
+//! nodes to select (explicit ids and/or filter-based discovery), where to send
+//! the output, and one or more tasks (scan / poll / subscribe / history) that
+//! run concurrently against the same session.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::cli::{
+    ConnectionArgs, Depth, FilterArgs, NodeClassArg, SecurityModeArg, SecurityPolicyArg, Strategy,
+};
+use crate::error::{Result, ScanError};
+
+/// A fully parsed acquisition configuration (one TOML file).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcquireConfig {
+    /// Connection / security settings.
+    #[serde(default)]
+    pub connection: ConnectionConfig,
+    /// Node selection (explicit ids and/or filters).
+    #[serde(default)]
+    pub selection: SelectionConfig,
+    /// Output destination and encoding.
+    #[serde(default)]
+    pub output: OutputConfig,
+    /// One or more acquisition tasks to run concurrently.
+    #[serde(default, rename = "task")]
+    pub tasks: Vec<TaskConfig>,
+}
+
+impl AcquireConfig {
+    /// Parse a configuration from a TOML file on disk.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).map_err(|e| ScanError::Config {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        Self::from_toml(&text).map_err(|reason| ScanError::Config {
+            path: path.to_path_buf(),
+            reason,
+        })
+    }
+
+    /// Parse a configuration from a TOML string.
+    pub fn from_toml(text: &str) -> std::result::Result<Self, String> {
+        let config: AcquireConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.tasks.is_empty() {
+            return Err("at least one [[task]] must be defined".to_string());
+        }
+        if self.selection.node_ids.is_empty()
+            && self.selection.nodes.is_empty()
+            && self.selection.include.is_empty()
+            && self.selection.include_regex.is_empty()
+            && self.selection.node_class.is_empty()
+            && self.selection.root.is_none()
+        {
+            // A scan-only run may legitimately use the default root, so only warn
+            // for sample-style tasks that need concrete nodes.
+            let needs_nodes = self
+                .tasks
+                .iter()
+                .any(|t| !matches!(t, TaskConfig::Scan { .. }));
+            if needs_nodes {
+                return Err(
+                    "[selection] must specify node_ids or filters for poll/subscribe/history tasks"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Build [`ConnectionArgs`] (reused by the OPC UA client layer) from config.
+    pub fn connection_args(&self) -> Result<ConnectionArgs> {
+        self.connection.to_args()
+    }
+
+    /// Build a [`FilterArgs`] for filter-based node selection.
+    pub fn filter_args(&self) -> Result<FilterArgs> {
+        self.selection.to_filter_args()
+    }
+}
+
+/// `[connection]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionConfig {
+    /// Endpoint URL, e.g. `opc.tcp://host:4840`.
+    pub endpoint: Option<String>,
+    /// Username for user/password authentication.
+    pub user: Option<String>,
+    /// Password (supports `env:VAR`).
+    pub password: Option<String>,
+    /// Client certificate (PEM/DER).
+    pub cert: Option<PathBuf>,
+    /// Client private key (PEM).
+    pub key: Option<PathBuf>,
+    /// Security policy: `None`, `Basic256Sha256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`.
+    pub security_policy: Option<String>,
+    /// Security mode: `None`, `Sign`, `SignAndEncrypt`.
+    pub security_mode: Option<String>,
+    /// Automatically trust the server certificate (insecure).
+    #[serde(default)]
+    pub trust_server: bool,
+    /// PKI directory.
+    pub pki_dir: Option<PathBuf>,
+    /// Per-request timeout (e.g. `10s`).
+    #[serde(default, deserialize_with = "de_opt_duration")]
+    pub timeout: Option<Duration>,
+    /// Retry attempts for transient failures.
+    pub retry: Option<u32>,
+    /// Metadata cache directory.
+    pub cache: Option<PathBuf>,
+}
+
+impl ConnectionConfig {
+    fn to_args(&self) -> Result<ConnectionArgs> {
+        Ok(ConnectionArgs {
+            endpoint: self.endpoint.clone(),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            cert: self.cert.clone(),
+            key: self.key.clone(),
+            security_policy: parse_security_policy(self.security_policy.as_deref())?,
+            security_mode: parse_security_mode(self.security_mode.as_deref())?,
+            trust_server: self.trust_server,
+            pki_dir: self.pki_dir.clone(),
+            timeout: self.timeout.unwrap_or_else(|| Duration::from_secs(10)),
+            retry: self.retry.unwrap_or(3),
+            cache: self.cache.clone(),
+        })
+    }
+
+    /// Fill in connection settings from this config where the CLI did not
+    /// provide them. CLI flags take precedence: a value is only taken from the
+    /// config when the corresponding CLI argument is unset or still at its
+    /// default (e.g. no endpoint, security policy `None`, `trust_server` false).
+    pub fn apply_to(&self, args: &mut ConnectionArgs) -> Result<()> {
+        if args.endpoint.is_none() {
+            args.endpoint = self.endpoint.clone();
+        }
+        if args.user.is_none() {
+            args.user = self.user.clone();
+        }
+        if args.password.is_none() {
+            args.password = self.password.clone();
+        }
+        if args.cert.is_none() {
+            args.cert = self.cert.clone();
+        }
+        if args.key.is_none() {
+            args.key = self.key.clone();
+        }
+        if args.pki_dir.is_none() {
+            args.pki_dir = self.pki_dir.clone();
+        }
+        if args.cache.is_none() {
+            args.cache = self.cache.clone();
+        }
+        if args.security_policy == SecurityPolicyArg::None {
+            args.security_policy = parse_security_policy(self.security_policy.as_deref())?;
+        }
+        if args.security_mode == SecurityModeArg::None {
+            args.security_mode = parse_security_mode(self.security_mode.as_deref())?;
+        }
+        if !args.trust_server {
+            args.trust_server = self.trust_server;
+        }
+        Ok(())
+    }
+}
+
+/// `[selection]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionConfig {
+    /// Explicit node ids (e.g. `ns=2;s=Foo`).
+    ///
+    /// Legacy form: bare id strings whose namespace index is taken literally.
+    /// Prefer `[[selection.node]]` entries (see [`NodeSelector`]) which also
+    /// record the namespace URI so the id stays correct if the server reorders
+    /// its namespace array.
+    #[serde(default)]
+    pub node_ids: Vec<String>,
+    /// Explicit nodes with namespace URI and a friendly name.
+    #[serde(default, rename = "node")]
+    pub nodes: Vec<NodeSelector>,
+    /// Starting node id for filter-based discovery (defaults to Objects).
+    pub root: Option<String>,
+    /// Maximum traversal depth (number or `unlimited`).
+    pub depth: Option<String>,
+    /// Include globs against the browse path.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Include regexes against the browse path.
+    #[serde(default)]
+    pub include_regex: Vec<String>,
+    /// Exclude globs.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Exclude regexes.
+    #[serde(default)]
+    pub exclude_regex: Vec<String>,
+    /// Restrict to these namespace URIs.
+    #[serde(default)]
+    pub include_ns: Vec<String>,
+    /// Node classes to keep (e.g. `["Variable"]`).
+    #[serde(default)]
+    pub node_class: Vec<String>,
+    /// Restrict Variables to these data types.
+    #[serde(default)]
+    pub datatype: Vec<String>,
+}
+
+impl SelectionConfig {
+    fn to_filter_args(&self) -> Result<FilterArgs> {
+        let node_class = self
+            .node_class
+            .iter()
+            .map(|s| parse_node_class(s))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(FilterArgs {
+            include: self.include.clone(),
+            include_regex: self.include_regex.clone(),
+            exclude: self.exclude.clone(),
+            exclude_regex: self.exclude_regex.clone(),
+            include_ns: self.include_ns.clone(),
+            ns_uri: None,
+            ns_index: None,
+            node_class,
+            datatype: self.datatype.clone(),
+            readable: false,
+            writable: false,
+            historizing: false,
+            subscribable: false,
+        })
+    }
+
+    /// Parsed traversal depth (defaults to 3 when unspecified).
+    pub fn depth(&self) -> Result<Depth> {
+        match &self.depth {
+            None => Ok(Depth::Limited(3)),
+            Some(s) => crate::cli::parse_depth(s).map_err(ScanError::InvalidArgument),
+        }
+    }
+}
+
+/// A single explicit node in `[[selection.node]]`.
+///
+/// The `namespace` URI makes the selection robust against the server reordering
+/// its namespace array: the stored numeric index in `id` is remapped to the
+/// server's current index for `namespace` at acquisition time.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSelector {
+    /// Node id string (e.g. `ns=4;i=1274`).
+    pub id: String,
+    /// Namespace URI the node belongs to. When present, the index in `id` is
+    /// remapped to the server's current index for this URI.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Friendly display name (used as the measurement name in output).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// `[output]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputConfig {
+    /// Output format.
+    #[serde(default)]
+    pub format: OutputFormat,
+    /// Write to this file instead of stdout.
+    pub file: Option<PathBuf>,
+    /// MQTT topic to prefix each line with (for piping to `tedge mqtt pub`).
+    pub topic: Option<String>,
+}
+
+/// Output encoding for acquired data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    /// thin-edge.io JSON measurements, one object per line.
+    #[default]
+    Tedge,
+    /// JSON array (batch) for records / NDJSON for streamed samples.
+    Json,
+    /// Newline-delimited JSON.
+    Ndjson,
+    /// Comma separated values.
+    Csv,
+}
+
+/// A single `[[task]]` entry. The `mode` field selects the variant.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+pub enum TaskConfig {
+    /// Address space scanning (structural discovery).
+    Scan {
+        /// Traversal strategy.
+        #[serde(default)]
+        strategy: ScanStrategy,
+        /// Concurrent browse workers.
+        workers: Option<usize>,
+        /// References per browse call.
+        page_size: Option<u32>,
+        /// Per-branch child cap.
+        max_children: Option<usize>,
+        /// Read current values for matched variables.
+        #[serde(default)]
+        preview_values: bool,
+    },
+    /// Cyclic reading (polling) of selected variables.
+    Poll {
+        /// Polling interval (e.g. `5s`).
+        #[serde(deserialize_with = "de_duration")]
+        interval: Duration,
+    },
+    /// Real-time subscription to selected variables.
+    Subscribe {
+        /// Publishing interval (e.g. `500ms`).
+        #[serde(default, deserialize_with = "de_opt_duration")]
+        publishing_interval: Option<Duration>,
+        /// Server-side sampling interval (e.g. `250ms`).
+        #[serde(default, deserialize_with = "de_opt_duration")]
+        sampling_interval: Option<Duration>,
+        /// Monitored item queue size.
+        queue_size: Option<u32>,
+    },
+    /// Historical (raw) data retrieval for selected variables.
+    History {
+        /// Inclusive start time (RFC3339, e.g. `2024-01-01T00:00:00Z`).
+        start: String,
+        /// Exclusive end time (RFC3339). Defaults to now.
+        end: Option<String>,
+        /// Maximum values per node per request.
+        max_values: Option<u32>,
+    },
+}
+
+/// Scan traversal strategy (serde mirror of [`Strategy`]).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanStrategy {
+    /// Breadth-first.
+    #[default]
+    Bfs,
+    /// Depth-first.
+    Dfs,
+}
+
+impl From<ScanStrategy> for Strategy {
+    fn from(s: ScanStrategy) -> Self {
+        match s {
+            ScanStrategy::Bfs => Strategy::Bfs,
+            ScanStrategy::Dfs => Strategy::Dfs,
+        }
+    }
+}
+
+fn parse_security_policy(s: Option<&str>) -> Result<SecurityPolicyArg> {
+    match s.map(str::trim) {
+        None | Some("") => Ok(SecurityPolicyArg::None),
+        Some(v) if v.eq_ignore_ascii_case("none") => Ok(SecurityPolicyArg::None),
+        Some(v) if v.eq_ignore_ascii_case("Basic256Sha256") => {
+            Ok(SecurityPolicyArg::Basic256Sha256)
+        }
+        Some(v) if v.eq_ignore_ascii_case("Aes128Sha256RsaOaep") => {
+            Ok(SecurityPolicyArg::Aes128Sha256RsaOaep)
+        }
+        Some(v) if v.eq_ignore_ascii_case("Aes256Sha256RsaPss") => {
+            Ok(SecurityPolicyArg::Aes256Sha256RsaPss)
+        }
+        Some(v) => Err(ScanError::InvalidArgument(format!(
+            "invalid security_policy '{v}'"
+        ))),
+    }
+}
+
+fn parse_security_mode(s: Option<&str>) -> Result<SecurityModeArg> {
+    match s.map(str::trim) {
+        None | Some("") => Ok(SecurityModeArg::None),
+        Some(v) if v.eq_ignore_ascii_case("none") => Ok(SecurityModeArg::None),
+        Some(v) if v.eq_ignore_ascii_case("sign") => Ok(SecurityModeArg::Sign),
+        Some(v) if v.eq_ignore_ascii_case("SignAndEncrypt") => Ok(SecurityModeArg::SignAndEncrypt),
+        Some(v) => Err(ScanError::InvalidArgument(format!(
+            "invalid security_mode '{v}'"
+        ))),
+    }
+}
+
+fn parse_node_class(s: &str) -> Result<NodeClassArg> {
+    let v = s.trim();
+    let class = match v.to_ascii_lowercase().as_str() {
+        "object" => NodeClassArg::Object,
+        "variable" => NodeClassArg::Variable,
+        "method" => NodeClassArg::Method,
+        "objecttype" => NodeClassArg::ObjectType,
+        "variabletype" => NodeClassArg::VariableType,
+        "referencetype" => NodeClassArg::ReferenceType,
+        "datatype" => NodeClassArg::DataType,
+        "view" => NodeClassArg::View,
+        _ => {
+            return Err(ScanError::InvalidArgument(format!(
+                "invalid node class '{v}'"
+            )))
+        }
+    };
+    Ok(class)
+}
+
+/// Deserialize a required humantime duration string (e.g. `5s`).
+fn de_duration<'de, D>(de: D) -> std::result::Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(de)?;
+    humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+}
+
+/// Deserialize an optional humantime duration string.
+fn de_opt_duration<'de, D>(de: D) -> std::result::Result<Option<Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(de)?;
+    match s {
+        None => Ok(None),
+        Some(s) => humantime::parse_duration(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_task_modes() {
+        let toml = r#"
+[connection]
+endpoint = "opc.tcp://host:4840"
+trust_server = true
+timeout = "5s"
+
+[selection]
+node_ids = ["ns=2;s=Foo"]
+root = "i=85"
+depth = "unlimited"
+include = ["**/Temperature"]
+node_class = ["Variable"]
+
+[output]
+format = "tedge"
+topic = "te/device/main///m/opcua"
+
+[[task]]
+mode = "scan"
+strategy = "dfs"
+workers = 4
+
+[[task]]
+mode = "poll"
+interval = "5s"
+
+[[task]]
+mode = "subscribe"
+publishing_interval = "500ms"
+sampling_interval = "250ms"
+queue_size = 20
+
+[[task]]
+mode = "history"
+start = "2024-01-01T00:00:00Z"
+max_values = 1000
+"#;
+        let config = AcquireConfig::from_toml(toml).expect("config should parse");
+        assert_eq!(config.tasks.len(), 4);
+        assert_eq!(config.output.format, OutputFormat::Tedge);
+        assert_eq!(config.selection.node_ids, vec!["ns=2;s=Foo".to_string()]);
+        assert!(matches!(config.selection.depth(), Ok(Depth::Unlimited)));
+
+        let args = config.connection_args().expect("connection args");
+        assert!(args.trust_server);
+        assert_eq!(args.timeout, Duration::from_secs(5));
+
+        assert!(matches!(config.tasks[0], TaskConfig::Scan { workers: Some(4), .. }));
+        assert!(matches!(config.tasks[1], TaskConfig::Poll { .. }));
+        assert!(matches!(config.tasks[2], TaskConfig::Subscribe { .. }));
+        assert!(matches!(config.tasks[3], TaskConfig::History { .. }));
+    }
+
+    #[test]
+    fn rejects_empty_tasks() {
+        let err = AcquireConfig::from_toml("[connection]\nendpoint = \"opc.tcp://h:1\"\n")
+            .expect_err("should reject config without tasks");
+        assert!(err.contains("task"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_fields() {
+        let toml = r#"
+[selection]
+node_ids = ["i=1"]
+[[task]]
+mode = "poll"
+interval = "1s"
+bogus = true
+"#;
+        assert!(AcquireConfig::from_toml(toml).is_err());
+    }
+}

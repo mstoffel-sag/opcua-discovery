@@ -209,3 +209,124 @@ pub async fn run_sample(
     let _ = session.delete_subscription(subscription_id).await;
     StatusCode::Good
 }
+
+/// Subscribe to the given nodes and stream value changes into `sink` until
+/// `cancel` is set. Cleans up the subscription on exit.
+pub async fn run_subscription(
+    session: &Arc<Session>,
+    nodes: Vec<crate::acquire::selection::SelectedNode>,
+    params: SubscriptionParams,
+    sink: Arc<crate::acquire::sink::Sink>,
+    cancel: Arc<AtomicBool>,
+) -> StatusCode {
+    use crate::acquire::sink::Sample;
+    use crate::opcua::value::variant_to_json;
+
+    if nodes.is_empty() {
+        return StatusCode::Good;
+    }
+
+    // Map node id -> measurement name for friendly output.
+    let name_map: Arc<HashMap<NodeId, String>> = Arc::new(
+        nodes
+            .iter()
+            .map(|n| (n.node_id.clone(), n.name.clone()))
+            .collect(),
+    );
+    let cb_map = name_map.clone();
+    let cb_sink = sink.clone();
+
+    let subscription_id = match session
+        .create_subscription(
+            params.publishing_interval,
+            10,
+            30,
+            0,
+            0,
+            true,
+            DataChangeCallback::new(move |dv, item| {
+                let node_id = item.item_to_monitor().node_id.clone();
+                let name = cb_map
+                    .get(&node_id)
+                    .cloned()
+                    .unwrap_or_else(|| node_id.to_string());
+                let value = dv
+                    .value
+                    .as_ref()
+                    .map(variant_to_json)
+                    .unwrap_or(serde_json::Value::Null);
+                let time = dv
+                    .source_timestamp
+                    .as_ref()
+                    .or(dv.server_timestamp.as_ref())
+                    .map(|t| t.to_rfc3339());
+                let status = dv.status.filter(|s| !s.is_good()).map(|s| s.to_string());
+                let sample = Sample {
+                    name,
+                    node_id: node_id.to_string(),
+                    value,
+                    time,
+                    status,
+                };
+                if let Err(e) = cb_sink.emit_sample(&sample) {
+                    warn!(error = %e, "failed to emit subscription sample");
+                }
+            }),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(status) => {
+            warn!(%status, "could not create subscription");
+            return status;
+        }
+    };
+
+    let requests: Vec<MonitoredItemCreateRequest> = nodes
+        .iter()
+        .map(|n| {
+            let mut req: MonitoredItemCreateRequest = n.node_id.clone().into();
+            req.requested_parameters.sampling_interval = params.sampling_interval.as_millis() as f64;
+            req.requested_parameters.queue_size = params.queue_size;
+            req
+        })
+        .collect();
+
+    if let Err(status) = session
+        .create_monitored_items(subscription_id, TimestampsToReturn::Both, requests)
+        .await
+    {
+        warn!(%status, "could not create monitored items");
+        let _ = session.delete_subscription(subscription_id).await;
+        return status;
+    }
+
+    // Run until cancelled.
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let _ = session.delete_subscription(subscription_id).await;
+    StatusCode::Good
+}
+
+/// Parameters controlling a long-lived subscription.
+#[derive(Debug, Clone)]
+pub struct SubscriptionParams {
+    /// Publishing interval.
+    pub publishing_interval: Duration,
+    /// Server-side sampling interval per monitored item.
+    pub sampling_interval: Duration,
+    /// Monitored item queue size.
+    pub queue_size: u32,
+}
+
+impl Default for SubscriptionParams {
+    fn default() -> Self {
+        Self {
+            publishing_interval: Duration::from_millis(500),
+            sampling_interval: Duration::from_millis(250),
+            queue_size: 10,
+        }
+    }
+}

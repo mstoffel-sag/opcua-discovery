@@ -1,0 +1,340 @@
+//! Generate a runnable `acquire` TOML config from an interactive selection.
+//!
+//! This is the write-side counterpart to [`crate::acquire::config`] (which only
+//! deserializes). The TUI uses it to turn a set of selected nodes into a ready
+//! config that `opcua-scan acquire --config <file>` can run directly.
+//!
+//! Secrets are never written: a `user` is recorded but the password is left as a
+//! commented hint, so the generated file is safe to share or commit.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::Serialize;
+
+use crate::error::{Result, ScanError};
+
+/// The acquisition mode chosen for the generated task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenMode {
+    /// Cyclic reading at a fixed interval.
+    Poll,
+    /// Real-time subscription with the interval as the publishing interval.
+    Subscribe,
+}
+
+/// Connection details to embed in the generated `[connection]` table.
+#[derive(Debug, Clone, Default)]
+pub struct GenConnection {
+    /// Endpoint URL.
+    pub endpoint: String,
+    /// Whether the server certificate is trusted automatically.
+    pub trust_server: bool,
+    /// Security policy name, if not the default `None`.
+    pub security_policy: Option<String>,
+    /// Security mode name, if not the default `None`.
+    pub security_mode: Option<String>,
+    /// Username, if user/password auth is in use (password is NOT written).
+    pub user: Option<String>,
+    /// PKI directory, if set.
+    pub pki_dir: Option<PathBuf>,
+}
+
+/// A selected node to write into the generated config. Carries the namespace
+/// URI (so the numeric index can be remapped if the server reorders its
+/// namespace array) and a friendly name for recognizability.
+#[derive(Debug, Clone, Default)]
+pub struct GenNode {
+    /// Node id string (e.g. `ns=4;i=1274`).
+    pub id: String,
+    /// Namespace URI, when known (empty/`None` for the base namespace).
+    pub namespace: Option<String>,
+    /// Friendly display name.
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedConfig {
+    connection: GenConnectionToml,
+    selection: GenSelectionToml,
+    output: GenOutputToml,
+    task: Vec<GenTaskToml>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenConnectionToml {
+    endpoint: String,
+    #[serde(skip_serializing_if = "is_false")]
+    trust_server: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pki_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenSelectionToml {
+    node: Vec<GenNodeToml>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenNodeToml {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+impl From<&GenNode> for GenNodeToml {
+    fn from(n: &GenNode) -> Self {
+        Self {
+            id: n.id.clone(),
+            namespace: n.namespace.clone().filter(|s| !s.is_empty()),
+            name: n.name.clone().filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GenOutputToml {
+    format: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GenTaskToml {
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interval: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publishing_interval: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Build a runnable acquire TOML document from a connection, the selected
+/// nodes, and the chosen acquisition mode + interval.
+pub fn generate_toml(
+    conn: &GenConnection,
+    nodes: Vec<GenNode>,
+    mode: GenMode,
+    interval: Duration,
+) -> Result<String> {
+    let interval_str = humantime::format_duration(interval).to_string();
+    let task = match mode {
+        GenMode::Poll => GenTaskToml {
+            mode: "poll".to_string(),
+            interval: Some(interval_str),
+            publishing_interval: None,
+        },
+        GenMode::Subscribe => GenTaskToml {
+            mode: "subscribe".to_string(),
+            interval: None,
+            publishing_interval: Some(interval_str),
+        },
+    };
+
+    let config = GeneratedConfig {
+        connection: GenConnectionToml {
+            endpoint: conn.endpoint.clone(),
+            trust_server: conn.trust_server,
+            security_policy: conn.security_policy.clone(),
+            security_mode: conn.security_mode.clone(),
+            user: conn.user.clone(),
+            pki_dir: conn
+                .pki_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
+        },
+        selection: GenSelectionToml {
+            node: nodes.iter().map(GenNodeToml::from).collect(),
+        },
+        output: GenOutputToml {
+            format: "tedge".to_string(),
+        },
+        task: vec![task],
+    };
+
+    let body = toml::to_string_pretty(&config).map_err(|e| ScanError::Export(e.to_string()))?;
+
+    let mut out = String::new();
+    out.push_str("# Generated by `opcua-scan browse --tui` (press 'a').\n");
+    out.push_str("# Run with: opcua-scan acquire --config <this file>\n");
+    if conn.user.is_some() {
+        out.push_str("# NOTE: set the password via `password = \"env:OPCUA_PASSWORD\"` under [connection].\n");
+    }
+    out.push('\n');
+    out.push_str(&body);
+    Ok(out)
+}
+
+/// Update only the selection of an existing acquire config, preserving
+/// everything else (connection, tasks, output, comments, and formatting). The
+/// selection is written as `[[selection.node]]` tables; any legacy `node_ids`
+/// array is removed (migrated). Used when re-saving a config loaded into the
+/// browse TUI.
+pub fn update_selection_in_toml(original: &str, nodes: &[GenNode]) -> Result<String> {
+    use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+
+    let mut doc: DocumentMut = original
+        .parse()
+        .map_err(|e: toml_edit::TomlError| ScanError::Export(e.to_string()))?;
+
+    // Ensure a `[selection]` table exists.
+    if !doc.contains_key("selection") {
+        doc["selection"] = Item::Table(Table::new());
+    }
+    let selection = doc["selection"]
+        .as_table_mut()
+        .ok_or_else(|| ScanError::Export("`selection` is not a table".to_string()))?;
+
+    // Migrate away from the legacy flat array.
+    selection.remove("node_ids");
+
+    let mut tables = ArrayOfTables::new();
+    for node in nodes {
+        let toml = GenNodeToml::from(node);
+        let mut t = Table::new();
+        t["id"] = toml_edit::value(toml.id);
+        if let Some(ns) = toml.namespace {
+            t["namespace"] = toml_edit::value(ns);
+        }
+        if let Some(name) = toml.name {
+            t["name"] = toml_edit::value(name);
+        }
+        tables.push(t);
+    }
+    selection.insert("node", Item::ArrayOfTables(tables));
+
+    Ok(doc.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acquire::config::{AcquireConfig, TaskConfig};
+
+    fn node(id: &str, namespace: Option<&str>, name: Option<&str>) -> GenNode {
+        GenNode {
+            id: id.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn poll_config_round_trips() {
+        let conn = GenConnection {
+            endpoint: "opc.tcp://host:4840".to_string(),
+            trust_server: true,
+            ..Default::default()
+        };
+        let toml = generate_toml(
+            &conn,
+            vec![
+                node("ns=2;s=Foo", Some("urn:example"), Some("Foo")),
+                node("i=2258", None, None),
+            ],
+            GenMode::Poll,
+            Duration::from_secs(1),
+        )
+        .expect("generate");
+
+        let parsed = AcquireConfig::from_toml(&toml).expect("re-parse generated config");
+        assert_eq!(parsed.connection.endpoint.as_deref(), Some("opc.tcp://host:4840"));
+        assert!(parsed.connection.trust_server);
+        assert_eq!(parsed.selection.nodes.len(), 2);
+        assert_eq!(parsed.selection.nodes[0].id, "ns=2;s=Foo");
+        assert_eq!(parsed.selection.nodes[0].namespace.as_deref(), Some("urn:example"));
+        assert_eq!(parsed.selection.nodes[0].name.as_deref(), Some("Foo"));
+        assert_eq!(parsed.selection.nodes[1].id, "i=2258");
+        assert!(parsed.selection.nodes[1].namespace.is_none());
+        assert_eq!(parsed.tasks.len(), 1);
+        assert!(matches!(parsed.tasks[0], TaskConfig::Poll { .. }));
+    }
+
+    #[test]
+    fn subscribe_config_round_trips() {
+        let conn = GenConnection {
+            endpoint: "opc.tcp://host:4840".to_string(),
+            ..Default::default()
+        };
+        let toml = generate_toml(
+            &conn,
+            vec![node("ns=2;s=Bar", None, None)],
+            GenMode::Subscribe,
+            Duration::from_millis(500),
+        )
+        .expect("generate");
+
+        let parsed = AcquireConfig::from_toml(&toml).expect("re-parse generated config");
+        assert!(matches!(parsed.tasks[0], TaskConfig::Subscribe { .. }));
+    }
+
+    #[test]
+    fn update_selection_preserves_rest() {
+        let original = "\
+# my acquire config
+[connection]
+endpoint = \"opc.tcp://host:4840\"
+trust_server = true
+
+[selection]
+node_ids = [\"ns=2;s=Old\"]
+
+[output]
+format = \"tedge\"
+
+[[task]]
+mode = \"poll\"
+interval = \"5s\"
+";
+        let updated = update_selection_in_toml(
+            original,
+            &[
+                node("ns=2;s=A", Some("urn:example"), Some("A")),
+                node("ns=2;s=B", None, None),
+            ],
+        )
+        .expect("update");
+
+        // Comment and other tables survive.
+        assert!(updated.contains("# my acquire config"));
+        assert!(updated.contains("trust_server = true"));
+        assert!(updated.contains("interval = \"5s\""));
+        // Legacy flat array is migrated away.
+        assert!(!updated.contains("node_ids"));
+
+        let parsed = AcquireConfig::from_toml(&updated).expect("re-parse updated config");
+        assert_eq!(parsed.selection.nodes.len(), 2);
+        assert_eq!(parsed.selection.nodes[0].id, "ns=2;s=A");
+        assert_eq!(parsed.selection.nodes[0].namespace.as_deref(), Some("urn:example"));
+        assert_eq!(parsed.selection.nodes[0].name.as_deref(), Some("A"));
+        assert_eq!(parsed.selection.nodes[1].id, "ns=2;s=B");
+        assert!(parsed.selection.node_ids.is_empty());
+        assert!(matches!(parsed.tasks[0], TaskConfig::Poll { .. }));
+    }
+
+    #[test]
+    fn update_selection_adds_table_when_missing() {
+        let original = "\
+[connection]
+endpoint = \"opc.tcp://host:4840\"
+trust_server = true
+
+[[task]]
+mode = \"scan\"
+";
+        let updated =
+            update_selection_in_toml(original, &[node("i=2258", None, None)]).expect("update");
+        let parsed = AcquireConfig::from_toml(&updated).expect("re-parse");
+        assert_eq!(parsed.selection.nodes.len(), 1);
+        assert_eq!(parsed.selection.nodes[0].id, "i=2258");
+    }
+}

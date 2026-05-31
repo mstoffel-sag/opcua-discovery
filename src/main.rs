@@ -1,5 +1,6 @@
 //! `opcua-scan` — a production-grade CLI for discovering an OPC UA namespace.
 
+mod acquire;
 mod cache;
 mod cli;
 mod config;
@@ -37,6 +38,7 @@ async fn main() {
         Command::Browse(args) => cli::browse::run(args, cancel).await,
         Command::Search(args) => cli::search::run(args, cancel).await,
         Command::Sample(args) => cli::sample::run(args, cancel).await,
+        Command::Acquire(args) => cli::acquire::run(args, cancel).await,
     };
 
     if let Err(err) = result {
@@ -67,5 +69,7 @@ fn apply_profile(cli: &mut Cli) -> Result<()> {
         Command::Sample(args) => {
             profile.apply(&mut args.connection, &mut args.traversal, &mut args.filters)
         }
+        // The acquire command is fully config-file driven; profiles do not apply.
+        Command::Acquire(_) => Ok(()),
     }
 }
