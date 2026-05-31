@@ -237,6 +237,12 @@ pub fn builtin_datatype_name(node_id: &NodeId) -> Option<&'static str> {
         28 => "UInteger",
         29 => "Enumeration",
         30 => "Image",
+        // Well-known builtin subtypes mapped to their base primitive, so
+        // their values are still typed (servers commonly use these).
+        290 => "Double",   // Duration
+        291 => "String",   // NumericRange
+        294 => "DateTime", // UtcTime
+        295 => "String",   // LocaleId
         _ => return None,
     })
 }
