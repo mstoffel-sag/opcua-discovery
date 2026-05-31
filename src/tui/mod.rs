@@ -31,6 +31,8 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use crate::cli::Encoding;
+use crate::acquire::config::NodeMode;
+use crate::acquire::generate::GenMode;
 use crate::error::{Result, ScanError};
 use crate::export::{write_export, NodeRecord};
 use crate::filters::{is_subscribable, FilterSet};
@@ -239,6 +241,8 @@ struct Node {
     loading: bool,
     /// Whether this node is marked for export (set on the whole subtree).
     marked: bool,
+    /// Per-node acquisition mode applied when marked (defaults to auto).
+    mode: NodeMode,
     attrs: Option<NodeAttributes>,
     value: Option<String>,
 }
@@ -287,12 +291,12 @@ impl App {
     ) -> Self {
         let status = if let Some(path) = &options.source_config {
             format!(
-                "editing {} · selection 0/{} located · ↑/↓ move · space mark · a save · q quit",
+                "editing {} · selection 0/{} located · ↑/↓ move · space mark · S/P sub/poll · a save · q quit",
                 path.display(),
                 options.selected_ids.len()
             )
         } else {
-            "↑/↓ move · →/← expand · space mark · V vars-only · v value · s validate · e export · a acquire · / filter · q quit".into()
+            "↑/↓ move · →/← expand · space mark · S sub · P poll · V vars-only · v value · s validate · e export · a acquire · / filter · q quit".into()
         };
         Self {
             session,
@@ -341,6 +345,7 @@ impl App {
             expandable: true,
             loading: false,
             marked,
+            mode: NodeMode::Auto,
             attrs: None,
             value: None,
         };
@@ -419,6 +424,7 @@ impl App {
                 expandable: child.expandable,
                 loading: false,
                 marked,
+                mode: NodeMode::Auto,
                 attrs: child.attrs,
                 value: None,
             };
@@ -611,6 +617,8 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.expand_selected().await,
             KeyCode::Left | KeyCode::Char('h') => self.collapse_selected(),
             KeyCode::Char(' ') => self.toggle_mark_selected(),
+            KeyCode::Char('S') => self.mark_mode_selected(GenMode::Subscribe),
+            KeyCode::Char('P') => self.mark_mode_selected(GenMode::Poll),
             KeyCode::Char('V') => self.toggle_vars_only(),
             KeyCode::Char('v') => self.preview_value().await,
             KeyCode::Char('s') => self.validate_selected().await,
@@ -815,6 +823,7 @@ impl App {
         let covered = self.ancestor_marked(idx);
         let now_marked = !self.arena[idx].marked;
         self.arena[idx].marked = now_marked;
+        self.arena[idx].mode = NodeMode::Auto;
         let n = self.marked_count();
         self.status = if now_marked {
             if covered {
@@ -833,6 +842,40 @@ impl App {
         };
     }
 
+    /// Mark the selected node (and its subtree) with an explicit acquisition
+    /// mode. Pressing the same mode again on an already-marked node unmarks it;
+    /// pressing a different mode switches it.
+    fn mark_mode_selected(&mut self, mode: GenMode) {
+        let Some(idx) = self.selected_idx() else {
+            return;
+        };
+        let target = match mode {
+            GenMode::Subscribe => NodeMode::Subscribe,
+            GenMode::Poll => NodeMode::Poll,
+        };
+        let label = self.arena[idx].label.clone();
+        if self.arena[idx].marked && self.arena[idx].mode == target {
+            self.arena[idx].marked = false;
+            self.arena[idx].mode = NodeMode::Auto;
+            let n = self.marked_count();
+            self.status = format!("unmarked {label} · {n} subtree(s) marked");
+            return;
+        }
+        let covered = self.ancestor_marked(idx);
+        self.arena[idx].marked = true;
+        self.arena[idx].mode = target;
+        let n = self.marked_count();
+        let verb = match mode {
+            GenMode::Subscribe => "subscribe",
+            GenMode::Poll => "poll",
+        };
+        self.status = if covered {
+            format!("marked {label} as {verb} (inside a marked parent) · {n} subtree(s) marked")
+        } else {
+            format!("marked {label} and its children as {verb} · {n} subtree(s) marked")
+        };
+    }
+
     /// Whether any *ancestor* of `idx` is explicitly marked.
     fn ancestor_marked(&self, idx: usize) -> bool {
         let mut cur = self.arena[idx].parent;
@@ -843,6 +886,18 @@ impl App {
             cur = self.arena[i].parent;
         }
         false
+    }
+
+    /// The mode of the nearest marked ancestor of `idx`, if any.
+    fn ancestor_mark_mode(&self, idx: usize) -> Option<NodeMode> {
+        let mut cur = self.arena[idx].parent;
+        while let Some(i) = cur {
+            if self.arena[i].marked {
+                return Some(self.arena[i].mode);
+            }
+            cur = self.arena[i].parent;
+        }
+        None
     }
 
     /// Toggle hiding of nodes that don't lead to Variables.
@@ -986,6 +1041,7 @@ impl App {
                 node_id: self.arena[idx].node_id.clone(),
                 path: self.arena[idx].path.clone(),
                 record: self.node_to_record(&self.arena[idx]),
+                mode: self.arena[idx].mode,
             })
             .collect();
 
@@ -1090,6 +1146,7 @@ impl App {
                 node_id: self.arena[idx].node_id.clone(),
                 path: self.arena[idx].path.clone(),
                 record: self.node_to_record(&self.arena[idx]),
+                mode: self.arena[idx].mode,
             })
             .collect();
 
@@ -1222,6 +1279,7 @@ impl App {
             namespace,
             name,
             path: Some(node.path.clone()).filter(|s| !s.is_empty()),
+            mode: gen_mode_of(node.mode),
         }
     }
 
@@ -1290,10 +1348,20 @@ impl App {
                     "  "
                 };
                 let (check, check_style) = if self.arena[idx].marked {
-                    ("[x] ", Style::default().fg(Color::Green))
-                } else if self.ancestor_marked(idx) {
-                    // Covered by a marked ancestor: show a lighter tick.
-                    ("[+] ", Style::default().fg(Color::Green))
+                    match self.arena[idx].mode {
+                        NodeMode::Subscribe => ("[S] ", Style::default().fg(Color::Cyan)),
+                        NodeMode::Poll => ("[P] ", Style::default().fg(Color::Yellow)),
+                        NodeMode::Auto => ("[x] ", Style::default().fg(Color::Green)),
+                    }
+                } else if let Some(mode) = self.ancestor_mark_mode(idx) {
+                    // Covered by a marked ancestor: show a lighter tick tinted
+                    // by the ancestor's mode.
+                    let color = match mode {
+                        NodeMode::Subscribe => Color::Cyan,
+                        NodeMode::Poll => Color::Yellow,
+                        NodeMode::Auto => Color::Green,
+                    };
+                    ("[+] ", Style::default().fg(color))
                 } else {
                     ("[ ] ", Style::default().fg(Color::DarkGray))
                 };
@@ -1486,6 +1554,8 @@ struct ExportRoot {
     node_id: NodeId,
     path: String,
     record: NodeRecord,
+    /// Acquisition mode for the marked subtree (ignored by JSON/CSV export).
+    mode: NodeMode,
 }
 
 /// Traversal settings reused by the background export's concurrent engine.
@@ -1593,12 +1663,16 @@ async fn collect_job(
     use std::sync::atomic::Ordering;
 
     // Build a GenNode from a discovered record, capturing the namespace URI.
-    fn to_gennode(record: &NodeRecord) -> crate::acquire::generate::GenNode {
+    fn to_gennode(
+        record: &NodeRecord,
+        mode: Option<GenMode>,
+    ) -> crate::acquire::generate::GenNode {
         crate::acquire::generate::GenNode {
             id: record.node_id.clone(),
             namespace: Some(record.namespace_uri.clone()).filter(|s| !s.is_empty()),
             name: Some(record.display_name.clone()).filter(|s| !s.is_empty()),
             path: Some(record.browse_path.clone()).filter(|s| !s.is_empty()),
+            mode,
         }
     }
 
@@ -1611,12 +1685,13 @@ async fn collect_job(
             break;
         }
 
+        let root_mode = gen_mode_of(root.mode);
         // Include the marked node itself if it is a Variable.
         if root.record.node_class == "Variable"
             && !record_is_unreadable_variable(&root.record)
             && seen.insert(root.record.node_id.clone())
         {
-            nodes.push(to_gennode(&root.record));
+            nodes.push(to_gennode(&root.record, root_mode));
         }
 
         let config = Arc::new(crate::scanner::ScanConfig {
@@ -1646,7 +1721,7 @@ async fn collect_job(
                 && !record_is_unreadable_variable(&record)
                 && seen.insert(record.node_id.clone())
             {
-                nodes.push(to_gennode(&record));
+                nodes.push(to_gennode(&record, root_mode));
             }
             if processed % 64 == 0 {
                 let _ = tx.send(JobMsg::Progress { processed }).await;
@@ -1658,6 +1733,16 @@ async fn collect_job(
     let _ = tx
         .send(JobMsg::CollectDone { result: Ok(nodes) })
         .await;
+}
+
+/// Map a per-node [`NodeMode`] to a [`GenMode`] for config generation; `Auto`
+/// has no explicit mode and follows the config default.
+fn gen_mode_of(mode: NodeMode) -> Option<GenMode> {
+    match mode {
+        NodeMode::Auto => None,
+        NodeMode::Subscribe => Some(GenMode::Subscribe),
+        NodeMode::Poll => Some(GenMode::Poll),
+    }
 }
 
 /// Parse an acquire prompt of the form `<poll|subscribe> <interval>` (interval

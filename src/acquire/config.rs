@@ -22,6 +22,9 @@ pub struct AcquireConfig {
     /// Connection / security settings.
     #[serde(default)]
     pub connection: ConnectionConfig,
+    /// Acquisition policy (default per-node mode, global poll-only override).
+    #[serde(default)]
+    pub acquire: AcquireOptions,
     /// Node selection (explicit ids and/or filters).
     #[serde(default)]
     pub selection: SelectionConfig,
@@ -31,6 +34,39 @@ pub struct AcquireConfig {
     /// One or more acquisition tasks to run concurrently.
     #[serde(default, rename = "task")]
     pub tasks: Vec<TaskConfig>,
+}
+
+/// How an individual node should be acquired when poll and subscribe tasks
+/// coexist. Stored per `[[selection.node]]` and resolved against the
+/// effective default at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeMode {
+    /// Decide automatically: subscribe when the server supports monitoring the
+    /// node, otherwise fall back to polling.
+    #[default]
+    Auto,
+    /// Always subscribe (real-time monitored item).
+    Subscribe,
+    /// Always poll (cyclic read).
+    Poll,
+}
+
+/// `[acquire]` table: acquisition policy that governs how per-node modes are
+/// resolved when both poll and subscribe behaviours are possible.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcquireOptions {
+    /// Default mode for nodes that do not specify one. When unset, it is
+    /// inferred from the configured tasks (see
+    /// [`AcquireConfig::effective_default_mode`]) so single-task configs keep
+    /// their historic behaviour.
+    #[serde(default)]
+    pub default_mode: Option<NodeMode>,
+    /// Force every node to be polled, ignoring any per-node or default
+    /// subscribe preference. Useful for servers with poor subscription support.
+    #[serde(default)]
+    pub poll_only: bool,
 }
 
 impl AcquireConfig {
@@ -89,6 +125,77 @@ impl AcquireConfig {
     pub fn filter_args(&self) -> Result<FilterArgs> {
         self.selection.to_filter_args()
     }
+
+    /// The default mode applied to nodes that don't specify one.
+    ///
+    /// When `[acquire].default_mode` is set it wins. Otherwise it is inferred
+    /// from the configured tasks so legacy single-task configs are unchanged:
+    /// a config with only a poll task polls everything, one with only a
+    /// subscribe task subscribes everything, and anything else defaults to
+    /// `auto` (subscribe-if-supported, else poll).
+    pub fn effective_default_mode(&self) -> NodeMode {
+        if let Some(m) = self.acquire.default_mode {
+            return m;
+        }
+        let has_poll = self.tasks.iter().any(|t| matches!(t, TaskConfig::Poll { .. }));
+        let has_subscribe = self
+            .tasks
+            .iter()
+            .any(|t| matches!(t, TaskConfig::Subscribe { .. }));
+        match (has_poll, has_subscribe) {
+            (true, false) => NodeMode::Poll,
+            (false, true) => NodeMode::Subscribe,
+            _ => NodeMode::Auto,
+        }
+    }
+
+    /// The poll interval to use for poll-routed nodes, taken from the first
+    /// poll task if present, otherwise a sensible default.
+    pub fn poll_interval(&self) -> Duration {
+        self.tasks
+            .iter()
+            .find_map(|t| match t {
+                TaskConfig::Poll { interval } => Some(*interval),
+                _ => None,
+            })
+            .unwrap_or(DEFAULT_POLL_INTERVAL)
+    }
+
+    /// Subscription parameters to use for subscribe-routed nodes, taken from
+    /// the first subscribe task if present, otherwise all defaults.
+    pub fn subscribe_params(&self) -> SubscribeParams {
+        self.tasks
+            .iter()
+            .find_map(|t| match t {
+                TaskConfig::Subscribe {
+                    publishing_interval,
+                    sampling_interval,
+                    queue_size,
+                } => Some(SubscribeParams {
+                    publishing_interval: *publishing_interval,
+                    sampling_interval: *sampling_interval,
+                    queue_size: *queue_size,
+                }),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Default poll interval applied when nodes are routed to polling but no poll
+/// task block supplied an interval.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Subscription parameters extracted from a `subscribe` task block (all
+/// optional; the subscription layer fills in its own defaults).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubscribeParams {
+    /// Publishing interval.
+    pub publishing_interval: Option<Duration>,
+    /// Server-side sampling interval.
+    pub sampling_interval: Option<Duration>,
+    /// Monitored item queue size.
+    pub queue_size: Option<u32>,
 }
 
 /// `[connection]` table.
@@ -281,6 +388,10 @@ pub struct NodeSelector {
     /// startup and (for file configs) written back here for later runs.
     #[serde(default)]
     pub path: Option<String>,
+    /// How this node should be acquired (`subscribe`, `poll`, or omitted for
+    /// `auto`). Routes the node to the matching task at runtime.
+    #[serde(default)]
+    pub mode: NodeMode,
 }
 
 /// `[output]` table.
@@ -545,5 +656,98 @@ interval = "1s"
 bogus = true
 "#;
         assert!(AcquireConfig::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn parses_per_node_mode_and_acquire_options() {
+        let toml = r#"
+[acquire]
+default_mode = "subscribe"
+poll_only = true
+
+[selection]
+[[selection.node]]
+id = "ns=2;s=A"
+mode = "poll"
+[[selection.node]]
+id = "ns=2;s=B"
+mode = "subscribe"
+[[selection.node]]
+id = "ns=2;s=C"
+
+[[task]]
+mode = "poll"
+interval = "2s"
+"#;
+        let config = AcquireConfig::from_toml(toml).expect("config should parse");
+        assert_eq!(config.acquire.default_mode, Some(NodeMode::Subscribe));
+        assert!(config.acquire.poll_only);
+        assert_eq!(config.selection.nodes[0].mode, NodeMode::Poll);
+        assert_eq!(config.selection.nodes[1].mode, NodeMode::Subscribe);
+        // Omitted mode defaults to auto.
+        assert_eq!(config.selection.nodes[2].mode, NodeMode::Auto);
+        // Explicit default wins over inference.
+        assert_eq!(config.effective_default_mode(), NodeMode::Subscribe);
+        assert_eq!(config.poll_interval(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn effective_default_mode_inferred_from_tasks() {
+        let poll_only = r#"
+[selection]
+node_ids = ["i=1"]
+[[task]]
+mode = "poll"
+interval = "1s"
+"#;
+        assert_eq!(
+            AcquireConfig::from_toml(poll_only)
+                .unwrap()
+                .effective_default_mode(),
+            NodeMode::Poll
+        );
+
+        let sub_only = r#"
+[selection]
+node_ids = ["i=1"]
+[[task]]
+mode = "subscribe"
+"#;
+        assert_eq!(
+            AcquireConfig::from_toml(sub_only)
+                .unwrap()
+                .effective_default_mode(),
+            NodeMode::Subscribe
+        );
+
+        let both = r#"
+[selection]
+node_ids = ["i=1"]
+[[task]]
+mode = "poll"
+interval = "1s"
+[[task]]
+mode = "subscribe"
+"#;
+        assert_eq!(
+            AcquireConfig::from_toml(both)
+                .unwrap()
+                .effective_default_mode(),
+            NodeMode::Auto
+        );
+    }
+
+    #[test]
+    fn poll_interval_falls_back_to_default() {
+        // A subscribe-only config still yields the default poll interval for
+        // any nodes routed to polling.
+        let toml = r#"
+[selection]
+node_ids = ["i=1"]
+[[task]]
+mode = "subscribe"
+"#;
+        let config = AcquireConfig::from_toml(toml).unwrap();
+        assert_eq!(config.poll_interval(), DEFAULT_POLL_INTERVAL);
     }
 }

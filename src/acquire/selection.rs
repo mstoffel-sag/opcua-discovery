@@ -16,10 +16,11 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::acquire::config::AcquireConfig;
+use crate::acquire::config::NodeMode;
 use crate::acquire::sink::SampleMeta;
 use crate::error::{Result, ScanError};
 use crate::export::NodeRecord;
-use crate::filters::predicate::{builtin_datatype_name, canonical_data_type};
+use crate::filters::predicate::{builtin_datatype_name, canonical_data_type, is_subscribable};
 use crate::filters::FilterSet;
 use crate::opcua::attributes::read_node_attributes;
 use crate::opcua::browse::browse_properties;
@@ -36,6 +37,11 @@ pub struct SelectedNode {
     pub path: String,
     /// Node id.
     pub node_id: NodeId,
+    /// Per-node acquisition mode (subscribe / poll / auto).
+    pub mode: NodeMode,
+    /// Whether the server reports the node as monitorable (Variable + readable).
+    /// Used to resolve [`NodeMode::Auto`] into subscribe or poll.
+    pub subscribable: bool,
     /// Descriptive context attached to every emitted sample.
     pub meta: SampleMeta,
 }
@@ -133,6 +139,7 @@ async fn resolve_explicit(
         configured_name: Option<String>,
         cached_path: Option<String>,
         config_id: Option<String>,
+        mode: NodeMode,
     }
     let mut parsed: Vec<Parsed> = Vec::with_capacity(nodes.len() + legacy_ids.len());
     for node in nodes {
@@ -142,6 +149,7 @@ async fn resolve_explicit(
             configured_name: node.name.clone(),
             cached_path: node.path.clone().filter(|s| !s.is_empty()),
             config_id: Some(node.id.clone()),
+            mode: node.mode,
         });
     }
     for id in legacy_ids {
@@ -152,6 +160,7 @@ async fn resolve_explicit(
             configured_name: None,
             cached_path: None,
             config_id: None,
+            mode: NodeMode::Auto,
         });
     }
 
@@ -214,6 +223,8 @@ async fn resolve_explicit(
             path: browse_path.unwrap_or_else(|| name_or_id(&attr.display_name, &p.id)),
             name,
             node_id: p.id,
+            mode: p.mode,
+            subscribable: is_subscribable(&attr),
             meta,
         });
     }
@@ -307,6 +318,11 @@ async fn resolve_filtered(
                     name: measurement_name(&record),
                     path: record.browse_path,
                     node_id,
+                    // Filtered discovery only keeps subscribable variables (the
+                    // scan applies the subscribable filter), so default to auto
+                    // routing which will prefer subscribe for these.
+                    mode: NodeMode::Auto,
+                    subscribable: true,
                     meta,
                 });
             }

@@ -25,7 +25,7 @@ use crate::opcua::Connection;
 use crate::scanner::{resolve_root, Engine, ScanConfig};
 use crate::subscription::{self, SubscriptionParams};
 
-use config::{AcquireConfig, TaskConfig};
+use config::{AcquireConfig, NodeMode, TaskConfig};
 use selection::SelectedNode;
 use sink::{Sample, SampleMeta, Sink};
 
@@ -94,17 +94,70 @@ pub async fn run(
         .any(|t| matches!(t, TaskConfig::Poll { .. } | TaskConfig::Subscribe { .. }));
 
     let mut set: JoinSet<()> = JoinSet::new();
+
+    // Scan and history tasks each operate on the full selection independently.
+    // Poll/subscribe tasks are not spawned per-block; instead the selection is
+    // partitioned once by each node's effective mode (see below), so a single
+    // run can poll some nodes while subscribing to others.
     for task in config.tasks.clone() {
-        spawn_task(
-            &mut set,
-            task,
-            session.clone(),
-            sink.clone(),
-            nodes.clone(),
-            namespaces.clone(),
-            config.clone(),
-            cancel.clone(),
+        match task {
+            TaskConfig::Scan { .. } | TaskConfig::History { .. } => {
+                spawn_task(
+                    &mut set,
+                    task,
+                    session.clone(),
+                    sink.clone(),
+                    nodes.clone(),
+                    namespaces.clone(),
+                    config.clone(),
+                    cancel.clone(),
+                );
+            }
+            TaskConfig::Poll { .. } | TaskConfig::Subscribe { .. } => {}
+        }
+    }
+
+    // Route the selected nodes to polling or subscribing based on their
+    // per-node mode, the effective default, and the global poll-only override.
+    if has_continuous && !nodes.is_empty() {
+        let default_mode = config.effective_default_mode();
+        let poll_only = config.acquire.poll_only;
+        let (poll_nodes, subscribe_nodes) = partition_nodes(&nodes, default_mode, poll_only);
+        info!(
+            poll = poll_nodes.len(),
+            subscribe = subscribe_nodes.len(),
+            poll_only,
+            "routed nodes by acquisition mode"
         );
+
+        if !poll_nodes.is_empty() {
+            let interval = config.poll_interval();
+            let session = session.clone();
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            set.spawn(async move {
+                run_poll(&session, &poll_nodes, &sink, interval, cancel).await;
+            });
+        }
+
+        if !subscribe_nodes.is_empty() {
+            let sp = config.subscribe_params();
+            let defaults = SubscriptionParams::default();
+            let params = SubscriptionParams {
+                publishing_interval: sp
+                    .publishing_interval
+                    .unwrap_or(defaults.publishing_interval),
+                sampling_interval: sp.sampling_interval.unwrap_or(defaults.sampling_interval),
+                queue_size: sp.queue_size.unwrap_or(defaults.queue_size),
+            };
+            let session = session.clone();
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            set.spawn(async move {
+                subscription::run_subscription(&session, subscribe_nodes, params, sink, cancel)
+                    .await;
+            });
+        }
     }
 
     // Bound continuous tasks by duration if requested.
@@ -165,27 +218,9 @@ fn spawn_task(
                 }
             });
         }
-        TaskConfig::Poll { interval } => {
-            set.spawn(async move {
-                run_poll(&session, &nodes, &sink, interval, cancel).await;
-            });
-        }
-        TaskConfig::Subscribe {
-            publishing_interval,
-            sampling_interval,
-            queue_size,
-        } => {
-            set.spawn(async move {
-                let defaults = SubscriptionParams::default();
-                let params = SubscriptionParams {
-                    publishing_interval: publishing_interval
-                        .unwrap_or(defaults.publishing_interval),
-                    sampling_interval: sampling_interval.unwrap_or(defaults.sampling_interval),
-                    queue_size: queue_size.unwrap_or(defaults.queue_size),
-                };
-                subscription::run_subscription(&session, nodes, params, sink, cancel).await;
-            });
-        }
+        // Poll/subscribe are not spawned per-task: nodes are partitioned by
+        // their effective mode in `run` and routed there instead.
+        TaskConfig::Poll { .. } | TaskConfig::Subscribe { .. } => {}
         TaskConfig::History {
             start,
             end,
@@ -201,6 +236,47 @@ fn spawn_task(
     }
 }
 
+/// Resolve a node's effective acquisition mode and split the selection into
+/// `(poll_nodes, subscribe_nodes)`.
+///
+/// `default_mode` is applied to nodes left at [`NodeMode::Auto`]; `poll_only`
+/// forces every node to poll regardless of its configured mode.
+fn partition_nodes(
+    nodes: &[SelectedNode],
+    default_mode: NodeMode,
+    poll_only: bool,
+) -> (Vec<SelectedNode>, Vec<SelectedNode>) {
+    let mut poll_nodes = Vec::new();
+    let mut subscribe_nodes = Vec::new();
+    for node in nodes {
+        if effective_subscribe(node, default_mode, poll_only) {
+            subscribe_nodes.push(node.clone());
+        } else {
+            poll_nodes.push(node.clone());
+        }
+    }
+    (poll_nodes, subscribe_nodes)
+}
+
+/// Whether a node should be subscribed (`true`) or polled (`false`) given the
+/// effective default and the global poll-only override.
+fn effective_subscribe(node: &SelectedNode, default_mode: NodeMode, poll_only: bool) -> bool {
+    if poll_only {
+        return false;
+    }
+    let mode = match node.mode {
+        NodeMode::Auto => default_mode,
+        explicit => explicit,
+    };
+    match mode {
+        NodeMode::Subscribe => true,
+        NodeMode::Poll => false,
+        // Default is itself auto: prefer subscribe only when the server reports
+        // the node as monitorable, otherwise fall back to polling.
+        NodeMode::Auto => node.subscribable,
+    }
+}
+
 struct ScanTaskParams {
     strategy: crate::cli::Strategy,
     workers: usize,
@@ -208,7 +284,6 @@ struct ScanTaskParams {
     max_children: Option<usize>,
     preview_values: bool,
 }
-
 async fn run_scan(
     session: &Arc<Session>,
     config: &AcquireConfig,
@@ -384,4 +459,92 @@ pub fn load_config_dir(dir: &std::path::Path) -> Result<Vec<(std::path::PathBuf,
         configs.push((path, config));
     }
     Ok(configs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acquire::sink::SampleMeta;
+
+    fn node(mode: NodeMode, subscribable: bool) -> SelectedNode {
+        SelectedNode {
+            name: "n".to_string(),
+            path: "n".to_string(),
+            node_id: NodeId::new(2, 1),
+            mode,
+            subscribable,
+            meta: SampleMeta::default(),
+        }
+    }
+
+    #[test]
+    fn poll_only_forces_polling() {
+        assert!(!effective_subscribe(
+            &node(NodeMode::Subscribe, true),
+            NodeMode::Subscribe,
+            true
+        ));
+    }
+
+    #[test]
+    fn explicit_mode_wins_over_default() {
+        assert!(effective_subscribe(
+            &node(NodeMode::Subscribe, false),
+            NodeMode::Poll,
+            false
+        ));
+        assert!(!effective_subscribe(
+            &node(NodeMode::Poll, true),
+            NodeMode::Subscribe,
+            false
+        ));
+    }
+
+    #[test]
+    fn auto_follows_non_auto_default() {
+        assert!(effective_subscribe(
+            &node(NodeMode::Auto, false),
+            NodeMode::Subscribe,
+            false
+        ));
+        assert!(!effective_subscribe(
+            &node(NodeMode::Auto, true),
+            NodeMode::Poll,
+            false
+        ));
+    }
+
+    #[test]
+    fn auto_default_uses_subscribability() {
+        assert!(effective_subscribe(
+            &node(NodeMode::Auto, true),
+            NodeMode::Auto,
+            false
+        ));
+        assert!(!effective_subscribe(
+            &node(NodeMode::Auto, false),
+            NodeMode::Auto,
+            false
+        ));
+    }
+
+    #[test]
+    fn partition_splits_by_effective_mode() {
+        let nodes = vec![
+            node(NodeMode::Subscribe, false),
+            node(NodeMode::Poll, true),
+            node(NodeMode::Auto, true),
+            node(NodeMode::Auto, false),
+        ];
+        let (poll, subscribe) = partition_nodes(&nodes, NodeMode::Auto, false);
+        // subscribe-explicit + auto-subscribable
+        assert_eq!(subscribe.len(), 2);
+        // poll-explicit + auto-not-subscribable
+        assert_eq!(poll.len(), 2);
+
+        // poll_only collapses everything to polling.
+        let (poll, subscribe) = partition_nodes(&nodes, NodeMode::Auto, true);
+        assert_eq!(poll.len(), 4);
+        assert!(subscribe.is_empty());
+    }
 }

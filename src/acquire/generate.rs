@@ -23,6 +23,16 @@ pub enum GenMode {
     Subscribe,
 }
 
+impl GenMode {
+    /// The TOML token for this mode (`poll` / `subscribe`).
+    fn token(self) -> &'static str {
+        match self {
+            GenMode::Poll => "poll",
+            GenMode::Subscribe => "subscribe",
+        }
+    }
+}
+
 /// Connection details to embed in the generated `[connection]` table.
 #[derive(Debug, Clone, Default)]
 pub struct GenConnection {
@@ -53,14 +63,23 @@ pub struct GenNode {
     pub name: Option<String>,
     /// Cached full browse path, when known.
     pub path: Option<String>,
+    /// Explicit per-node mode. `None` follows the config default (auto).
+    pub mode: Option<GenMode>,
 }
 
 #[derive(Debug, Serialize)]
 struct GeneratedConfig {
     connection: GenConnectionToml,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquire: Option<GenAcquireToml>,
     selection: GenSelectionToml,
     output: GenOutputToml,
     task: Vec<GenTaskToml>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenAcquireToml {
+    default_mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +111,8 @@ struct GenNodeToml {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
 }
 
 impl From<&GenNode> for GenNodeToml {
@@ -101,8 +122,21 @@ impl From<&GenNode> for GenNodeToml {
             namespace: n.namespace.clone().filter(|s| !s.is_empty()),
             name: n.name.clone().filter(|s| !s.is_empty()),
             path: n.path.clone().filter(|s| !s.is_empty()),
+            mode: n.mode.map(|m| m.token().to_string()),
         }
     }
+}
+
+/// Stable sort key for a selected node, so the written selection has a
+/// deterministic order regardless of how the caller collected the nodes.
+/// Without this, re-saving an unchanged selection can reorder the
+/// `[[selection.node]]` entries (the TUI gathers them from unordered
+/// collections), producing spurious diffs.
+fn sort_key(n: &GenNode) -> (String, String) {
+    (
+        n.namespace.clone().unwrap_or_default(),
+        n.id.clone(),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -123,27 +157,69 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Build a runnable acquire TOML document from a connection, the selected
-/// nodes, and the chosen acquisition mode + interval.
+/// Build a runnable acquire TOML document from a connection and the selected
+/// nodes.
+///
+/// `default_mode` is the acquisition mode applied to nodes that do not carry an
+/// explicit per-node mode; `interval` is the poll interval (and, for the
+/// subscribe task, the publishing interval). Task blocks are emitted for
+/// whichever modes the nodes actually resolve to, so a mixed selection produces
+/// both a `poll` and a `subscribe` task. An `[acquire]` table records the
+/// default whenever any node relies on it.
 pub fn generate_toml(
     conn: &GenConnection,
     nodes: Vec<GenNode>,
-    mode: GenMode,
+    default_mode: GenMode,
     interval: Duration,
 ) -> Result<String> {
     let interval_str = humantime::format_duration(interval).to_string();
-    let task = match mode {
-        GenMode::Poll => GenTaskToml {
+
+    // Stable ordering so an unchanged selection always serializes identically.
+    let mut nodes = nodes;
+    nodes.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+
+    // Resolve which modes are in play to decide which task blocks to emit.
+    let resolved = |n: &GenNode| n.mode.unwrap_or(default_mode);
+    let needs_poll = nodes.iter().any(|n| resolved(n) == GenMode::Poll);
+    let needs_subscribe = nodes.iter().any(|n| resolved(n) == GenMode::Subscribe);
+    let has_auto = nodes.iter().any(|n| n.mode.is_none());
+
+    let mut task = Vec::new();
+    if needs_poll {
+        task.push(GenTaskToml {
             mode: "poll".to_string(),
-            interval: Some(interval_str),
+            interval: Some(interval_str.clone()),
             publishing_interval: None,
-        },
-        GenMode::Subscribe => GenTaskToml {
+        });
+    }
+    if needs_subscribe {
+        task.push(GenTaskToml {
             mode: "subscribe".to_string(),
             interval: None,
-            publishing_interval: Some(interval_str),
-        },
-    };
+            publishing_interval: Some(interval_str.clone()),
+        });
+    }
+    // Fall back to a single task for the default mode when the selection is
+    // empty, so the generated config is still runnable.
+    if task.is_empty() {
+        task.push(match default_mode {
+            GenMode::Poll => GenTaskToml {
+                mode: "poll".to_string(),
+                interval: Some(interval_str.clone()),
+                publishing_interval: None,
+            },
+            GenMode::Subscribe => GenTaskToml {
+                mode: "subscribe".to_string(),
+                interval: None,
+                publishing_interval: Some(interval_str.clone()),
+            },
+        });
+    }
+
+    // Record the default only when at least one node relies on it.
+    let acquire = has_auto.then(|| GenAcquireToml {
+        default_mode: default_mode.token().to_string(),
+    });
 
     let config = GeneratedConfig {
         connection: GenConnectionToml {
@@ -157,13 +233,14 @@ pub fn generate_toml(
                 .as_ref()
                 .map(|p| p.display().to_string()),
         },
+        acquire,
         selection: GenSelectionToml {
             node: nodes.iter().map(GenNodeToml::from).collect(),
         },
         output: GenOutputToml {
             format: "tedge".to_string(),
         },
-        task: vec![task],
+        task,
     };
 
     let body = toml::to_string_pretty(&config).map_err(|e| ScanError::Export(e.to_string()))?;
@@ -202,6 +279,11 @@ pub fn update_selection_in_toml(original: &str, nodes: &[GenNode]) -> Result<Str
     // Migrate away from the legacy flat array.
     selection.remove("node_ids");
 
+    // Stable ordering so re-saving an unchanged selection does not reorder the
+    // `[[selection.node]]` entries.
+    let mut nodes: Vec<&GenNode> = nodes.iter().collect();
+    nodes.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+
     let mut tables = ArrayOfTables::new();
     for node in nodes {
         let toml = GenNodeToml::from(node);
@@ -215,6 +297,9 @@ pub fn update_selection_in_toml(original: &str, nodes: &[GenNode]) -> Result<Str
         }
         if let Some(path) = toml.path {
             t["path"] = toml_edit::value(path);
+        }
+        if let Some(mode) = toml.mode {
+            t["mode"] = toml_edit::value(mode);
         }
         tables.push(t);
     }
@@ -268,6 +353,7 @@ mod tests {
             namespace: namespace.map(str::to_string),
             name: name.map(str::to_string),
             path: None,
+            mode: None,
         }
     }
 
@@ -318,6 +404,51 @@ mod tests {
 
         let parsed = AcquireConfig::from_toml(&toml).expect("re-parse generated config");
         assert!(matches!(parsed.tasks[0], TaskConfig::Subscribe { .. }));
+    }
+
+    #[test]
+    fn mixed_mode_config_emits_both_tasks() {
+        use crate::acquire::config::NodeMode;
+
+        let conn = GenConnection {
+            endpoint: "opc.tcp://host:4840".to_string(),
+            ..Default::default()
+        };
+        let mut poll_node = node("ns=2;s=Poll", None, Some("P"));
+        poll_node.mode = Some(GenMode::Poll);
+        let mut sub_node = node("ns=2;s=Sub", None, Some("S"));
+        sub_node.mode = Some(GenMode::Subscribe);
+        let auto_node = node("ns=2;s=Auto", None, Some("A"));
+
+        let toml = generate_toml(
+            &conn,
+            vec![poll_node, sub_node, auto_node],
+            GenMode::Subscribe,
+            Duration::from_secs(2),
+        )
+        .expect("generate");
+
+        let parsed = AcquireConfig::from_toml(&toml).expect("re-parse generated config");
+        // Both poll and subscribe task blocks are present.
+        assert!(parsed.tasks.iter().any(|t| matches!(t, TaskConfig::Poll { .. })));
+        assert!(parsed
+            .tasks
+            .iter()
+            .any(|t| matches!(t, TaskConfig::Subscribe { .. })));
+        // Per-node modes survive; the auto node has no explicit mode.
+        let by_id = |id: &str| {
+            parsed
+                .selection
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.mode)
+        };
+        assert_eq!(by_id("ns=2;s=Poll"), Some(NodeMode::Poll));
+        assert_eq!(by_id("ns=2;s=Sub"), Some(NodeMode::Subscribe));
+        assert_eq!(by_id("ns=2;s=Auto"), Some(NodeMode::Auto));
+        // The default is recorded because an auto node relies on it.
+        assert_eq!(parsed.acquire.default_mode, Some(NodeMode::Subscribe));
     }
 
     #[test]

@@ -5,13 +5,33 @@
 endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer"
 trust_server = true
 
+# [acquire] controls how each node is acquired when both poll and subscribe
+# are possible.
+#   default_mode = "auto"      # auto = subscribe if supported, else poll
+#                              # (also accepts "subscribe" or "poll")
+#   poll_only    = false       # set true (or pass --poll-only) to disable
+#                              # subscriptions entirely
+[acquire]
+default_mode = "auto"
+
 [selection]
 # Server_ServerStatus_CurrentTime updates every second on the demo server.
 node_ids = ["i=2258"]
 
+# Per-node mode overrides the default. Omit `mode` (or set "auto") to follow
+# [acquire].default_mode; use "subscribe" for efficient push updates or "poll"
+# for cyclic reads.
+# [[selection.node]]
+# id = "ns=3;i=1001"
+# name = "Temperature"
+# mode = "subscribe"
+
 [output]
 format = "tedge"
 
+# Task blocks supply the parameters for each mode. Nodes are routed to the
+# matching task by their resolved mode, so a single run can poll some nodes
+# while subscribing to others.
 [[task]]
 mode = "poll"
 interval = "1s"
@@ -19,3 +39,5 @@ interval = "1s"
 # [[task]]
 # mode = "subscribe"
 # publishing_interval = "500ms"
+# sampling_interval = "250ms"
+

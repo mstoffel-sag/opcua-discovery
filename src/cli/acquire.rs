@@ -27,6 +27,11 @@ pub struct AcquireArgs {
     /// Bound continuous tasks (poll/subscribe) to this duration, e.g. 30s, 5m.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Option<Duration>,
+
+    /// Force all nodes to be polled, disabling subscriptions regardless of any
+    /// per-node or default subscribe preference in the config.
+    #[arg(long)]
+    pub poll_only: bool,
 }
 
 /// Run the `acquire` command.
@@ -41,8 +46,10 @@ pub async fn run(args: AcquireArgs, cancel: Arc<AtomicBool>) -> Result<()> {
         }
     };
 
-    for (path, config) in configs {
+    for (path, mut config) in configs {
         info!(config = %path.display(), "starting acquisition");
+        // CLI override wins: once set it can only force poll-only on, never off.
+        config.acquire.poll_only |= args.poll_only;
         acquire::run(config, args.duration, Some(path.as_path()), cancel.clone()).await?;
     }
 

@@ -12,6 +12,20 @@ use tracing::{debug, warn};
 
 use crate::export::NodeRecord;
 
+/// Server keep-alive count: after this many publishing intervals with no
+/// notifications the server sends a keep-alive message instead.
+const KEEP_ALIVE_COUNT: u32 = 10;
+
+/// Subscription lifetime count: the server discards an orphaned subscription
+/// after this many publishing intervals elapse without the session publishing.
+///
+/// OPC UA requires `lifetime_count >= 3 * max_keep_alive_count`; we use exactly
+/// 3x so a subscription left behind by an abruptly terminated client (e.g. a
+/// hard `kill`/double Ctrl+C) expires quickly rather than lingering long enough
+/// to exhaust the server's subscription limit (`BadTooManySubscriptions`) on
+/// the next run. At a 500ms publishing interval this is ~15s.
+const LIFETIME_COUNT: u32 = 3 * KEEP_ALIVE_COUNT;
+
 /// Validate that subscribable records can actually be monitored.
 ///
 /// Creates a single temporary subscription, attempts to create a monitored item
@@ -39,8 +53,8 @@ pub async fn validate_records(
     let subscription_id = match session
         .create_subscription(
             Duration::from_millis(1000),
-            10,
-            30,
+            LIFETIME_COUNT,
+            KEEP_ALIVE_COUNT,
             0,
             0,
             true,
@@ -100,8 +114,8 @@ pub async fn validate_one(
     let subscription_id = session
         .create_subscription(
             Duration::from_millis(1000),
-            10,
-            30,
+            LIFETIME_COUNT,
+            KEEP_ALIVE_COUNT,
             0,
             0,
             true,
@@ -154,8 +168,8 @@ pub async fn run_sample(
     let subscription_id = match session
         .create_subscription(
             Duration::from_millis(500),
-            10,
-            30,
+            LIFETIME_COUNT,
+            KEEP_ALIVE_COUNT,
             0,
             0,
             true,
@@ -244,8 +258,8 @@ pub async fn run_subscription(
     let subscription_id = match session
         .create_subscription(
             params.publishing_interval,
-            10,
-            30,
+            LIFETIME_COUNT,
+            KEEP_ALIVE_COUNT,
             0,
             0,
             true,
@@ -283,7 +297,17 @@ pub async fn run_subscription(
     {
         Ok(id) => id,
         Err(status) => {
-            warn!(%status, "could not create subscription");
+            if status == StatusCode::BadTooManySubscriptions {
+                warn!(
+                    %status,
+                    "server refused a new subscription (its subscription limit is reached); \
+                     this is often caused by orphaned subscriptions from a previous run that \
+                     was killed before cleanup — wait for them to time out (~15s) or restart \
+                     the server, or run with --poll-only to avoid subscriptions"
+                );
+            } else {
+                warn!(%status, "could not create subscription");
+            }
             return status;
         }
     };

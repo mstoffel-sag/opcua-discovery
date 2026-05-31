@@ -146,14 +146,73 @@ Keys:
 | `↑` / `↓` or `k` / `j` | Move selection |
 | `→` / `Enter` / `l` | Expand (browse children on demand) |
 | `←` / `h` | Collapse / go to parent |
+| `space` | Mark node/subtree (auto mode) for acquisition |
+| `S` | Mark node/subtree to **subscribe** |
+| `P` | Mark node/subtree to **poll** |
 | `v` | Preview the selected variable's value |
 | `s` | Validate subscription for the selected variable |
 | `e` | Export the loaded nodes (uses `--file`, or `opcua-scan-export.json`) |
+| `a` | Write an `acquire` config from the marked nodes |
 | `/` | Incremental path filter |
 | `g` / `G` | Jump to top / bottom |
 | `q` / `Esc` | Quit |
 
+Marked nodes are written into the generated `acquire` config with their chosen
+mode. Nodes marked with `space` (auto) follow the config's default mode —
+subscribe when the server supports monitoring the node, otherwise poll.
+
 The terminal is always restored on exit, even on panic.
+
+---
+
+## Acquisition modes: subscribe vs poll
+
+`acquire` configs select **per-node** how each variable is read:
+
+- **subscribe** — the server pushes value changes via an OPC UA monitored item
+  (efficient; preferred for most variables).
+- **poll** — the client reads the value cyclically at a fixed interval (use for
+  servers with limited or unreliable subscription support).
+- **auto** (default) — subscribe when the server reports the node as
+  monitorable, otherwise fall back to polling.
+
+Set the mode per node, choose a default, or force polling globally:
+
+```toml
+[acquire]
+default_mode = "auto"   # auto | subscribe | poll  (applied to nodes without a mode)
+poll_only    = false    # true disables all subscriptions (same as --poll-only)
+
+[[selection.node]]
+id = "ns=3;i=1001"
+name = "Temperature"
+mode = "subscribe"      # subscribe | poll | auto (omit = auto)
+
+[[selection.node]]
+id = "ns=3;i=1002"
+name = "LegacyCounter"
+mode = "poll"
+
+# Task blocks supply the parameters for each mode; nodes are routed to the
+# matching task by their resolved mode (a run can poll and subscribe at once).
+[[task]]
+mode = "poll"
+interval = "1s"
+
+[[task]]
+mode = "subscribe"
+publishing_interval = "500ms"
+```
+
+Force polling for a one-off run regardless of config:
+
+```bash
+opcua-scan acquire --config acquire.toml --poll-only
+```
+
+When `[acquire].default_mode` is omitted it is inferred from the tasks present
+(only a poll task → poll everything; only a subscribe task → subscribe
+everything), so existing single-task configs are unchanged.
 
 ---
 
