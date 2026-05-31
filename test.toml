@@ -3,6 +3,7 @@
 
 [connection]
 endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer"
+name = "SampleServer"
 
 [selection]
 
