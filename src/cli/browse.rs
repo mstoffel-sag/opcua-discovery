@@ -41,11 +41,6 @@ pub struct BrowseArgs {
     /// action) updates this file in place. CLI flags override config values.
     #[arg(long, value_name = "FILE")]
     pub config: Option<std::path::PathBuf>,
-
-    /// In the TUI, write the generated/updated `acquire` config to this file.
-    /// Defaults to `--config` (when given) or `acquire.toml`.
-    #[arg(long, value_name = "FILE")]
-    pub acquire_out: Option<std::path::PathBuf>,
 }
 
 /// Run the `browse` command.
@@ -95,11 +90,9 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
 
     // Interactive explorer: opt-in, replaces streaming/export output entirely.
     if args.output.tui {
-        // Write target: --acquire-out, else the source --config, else default.
-        let acquire_file = args
-            .acquire_out
+        // Write target: the source --config, else default.
+        let acquire_file = source_config
             .clone()
-            .or_else(|| source_config.clone())
             .unwrap_or_else(|| std::path::PathBuf::from("acquire.toml"));
         let options = crate::tui::TuiOptions {
             root,
