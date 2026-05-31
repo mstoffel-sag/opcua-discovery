@@ -1145,6 +1145,7 @@ impl App {
             id: node.node_id.to_string(),
             namespace,
             name,
+            path: Some(node.path.clone()).filter(|s| !s.is_empty()),
         }
     }
 
@@ -1521,6 +1522,7 @@ async fn collect_job(
             id: record.node_id.clone(),
             namespace: Some(record.namespace_uri.clone()).filter(|s| !s.is_empty()),
             name: Some(record.display_name.clone()).filter(|s| !s.is_empty()),
+            path: Some(record.browse_path.clone()).filter(|s| !s.is_empty()),
         }
     }
 

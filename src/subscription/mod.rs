@@ -219,18 +219,23 @@ pub async fn run_subscription(
     sink: Arc<crate::acquire::sink::Sink>,
     cancel: Arc<AtomicBool>,
 ) -> StatusCode {
-    use crate::acquire::sink::Sample;
+    use crate::acquire::sink::{Sample, SampleMeta};
     use crate::opcua::value::variant_to_json;
 
     if nodes.is_empty() {
         return StatusCode::Good;
     }
 
-    // Map node id -> measurement name for friendly output.
-    let name_map: Arc<HashMap<NodeId, String>> = Arc::new(
+    // Map node id -> (measurement name, metadata) for friendly, enriched output.
+    let name_map: Arc<HashMap<NodeId, (String, Arc<SampleMeta>)>> = Arc::new(
         nodes
             .iter()
-            .map(|n| (n.node_id.clone(), n.name.clone()))
+            .map(|n| {
+                (
+                    n.node_id.clone(),
+                    (n.name.clone(), Arc::new(n.meta.clone())),
+                )
+            })
             .collect(),
     );
     let cb_map = name_map.clone();
@@ -246,10 +251,10 @@ pub async fn run_subscription(
             true,
             DataChangeCallback::new(move |dv, item| {
                 let node_id = item.item_to_monitor().node_id.clone();
-                let name = cb_map
+                let (name, meta) = cb_map
                     .get(&node_id)
-                    .cloned()
-                    .unwrap_or_else(|| node_id.to_string());
+                    .map(|(name, meta)| (name.clone(), meta.clone()))
+                    .unwrap_or_else(|| (node_id.to_string(), Arc::new(SampleMeta::default())));
                 let value = dv
                     .value
                     .as_ref()
@@ -267,6 +272,7 @@ pub async fn run_subscription(
                     value,
                     time,
                     status,
+                    meta,
                 };
                 if let Err(e) = cb_sink.emit_sample(&sample) {
                     warn!(error = %e, "failed to emit subscription sample");

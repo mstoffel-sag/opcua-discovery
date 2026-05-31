@@ -221,7 +221,86 @@ interval = "300ms"
         .unwrap_or_else(|| panic!("no Temperature measurement emitted:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
     let value: Value = serde_json::from_str(line).expect("valid tedge JSON line");
     assert!(value.get("time").is_some(), "missing time field: {line}");
-    assert!(value.get("Temperature").is_some(), "missing measurement: {line}");
+    // The measurement key is now the full browse path, which ends with the leaf name.
+    let has_temperature_key = value
+        .as_object()
+        .map(|obj| obj.keys().any(|k| k.ends_with("Temperature")))
+        .unwrap_or(false);
+    assert!(has_temperature_key, "missing measurement keyed by browse path: {line}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn acquire_poll_emits_fixed_schema_ndjson() {
+    let endpoint = common::start();
+    let dir = std::env::temp_dir().join(format!("opcua-scan-ndjson-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pki = dir.join("pki");
+    let config_path = dir.join("acquire.toml");
+    let config = format!(
+        r#"
+[connection]
+endpoint = "{endpoint}"
+trust_server = true
+pki_dir = "{pki}"
+
+[selection]
+root = "i=85"
+depth = "unlimited"
+include = ["**/Temperature"]
+node_class = ["Variable"]
+
+[output]
+format = "ndjson"
+
+[[task]]
+mode = "poll"
+interval = "300ms"
+"#,
+        pki = pki.to_str().unwrap()
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_opcua-scan"))
+        .args([
+            "acquire",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--duration",
+            "1500ms",
+        ])
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run acquire");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("Temperature"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no Temperature record emitted:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    let value: Value = serde_json::from_str(line).expect("valid ndjson line");
+
+    // Fixed schema: every top-level key is always present.
+    for key in ["time", "key", "value", "dataType", "nodeId", "units", "status", "meta"] {
+        assert!(value.get(key).is_some(), "missing fixed key '{key}': {line}");
+    }
+    assert_eq!(
+        value.get("key").and_then(Value::as_str).map(|k| k.ends_with("Temperature")),
+        Some(true),
+        "expected key to be the full browse path ending in Temperature: {line}"
+    );
+    assert_eq!(
+        value.get("dataType").and_then(Value::as_str),
+        Some("float64"),
+        "expected normalized dataType: {line}"
+    );
+    assert!(value.get("meta").map(Value::is_object).unwrap_or(false), "meta not an object: {line}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -16,11 +16,15 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::acquire::config::AcquireConfig;
+use crate::acquire::sink::SampleMeta;
 use crate::error::{Result, ScanError};
 use crate::export::NodeRecord;
+use crate::filters::predicate::{builtin_datatype_name, canonical_data_type};
 use crate::filters::FilterSet;
 use crate::opcua::attributes::read_node_attributes;
+use crate::opcua::browse::browse_properties;
 use crate::opcua::namespaces::NamespaceTable;
+use crate::opcua::value::{eu_label_from_data_value, range_from_data_value, read_data_values};
 use crate::scanner::{resolve_root, Engine, ScanConfig};
 
 /// A selected node ready for sampling.
@@ -32,20 +36,38 @@ pub struct SelectedNode {
     pub path: String,
     /// Node id.
     pub node_id: NodeId,
+    /// Descriptive context attached to every emitted sample.
+    pub meta: SampleMeta,
+}
+
+/// The outcome of resolving a selection: the concrete nodes plus any browse
+/// paths that were reconstructed from the server and should be cached back into
+/// the config file.
+#[derive(Debug, Default)]
+pub struct Resolved {
+    /// Resolved nodes ready for sampling.
+    pub nodes: Vec<SelectedNode>,
+    /// `(config node id, reconstructed path)` pairs for explicit nodes whose
+    /// path was discovered (i.e. not already cached in the config).
+    pub path_updates: Vec<(String, String)>,
 }
 
 /// Resolve the configured selection into a concrete list of nodes.
+///
+/// `endpoint` is the connected endpoint URL, attached to every node as the
+/// source endpoint; the optional source name comes from `[connection] name`.
 pub async fn resolve(
     session: &Arc<Session>,
     config: &AcquireConfig,
     namespaces: &Arc<NamespaceTable>,
+    endpoint: &str,
     cancel: Arc<AtomicBool>,
-) -> Result<Vec<SelectedNode>> {
+) -> Result<Resolved> {
     let mut seen: HashSet<NodeId> = HashSet::new();
     let mut nodes: Vec<SelectedNode> = Vec::new();
 
     // 1. Explicit nodes (rich `[[selection.node]]` entries) + legacy `node_ids`.
-    let explicit = resolve_explicit(
+    let (explicit, path_updates) = resolve_explicit(
         session,
         &config.selection.nodes,
         &config.selection.node_ids,
@@ -68,7 +90,21 @@ pub async fn resolve(
         }
     }
 
-    Ok(nodes)
+    // 3. Fold EURange / EngineeringUnits properties into their parent nodes and
+    //    drop any that were selected as standalone nodes.
+    enrich_metadata(session, &mut nodes).await?;
+
+    // 4. Stamp the data source (endpoint + friendly name) onto every node.
+    let source_name = config.connection.name.clone();
+    for node in &mut nodes {
+        node.meta.source_endpoint = Some(endpoint.to_string());
+        node.meta.source_name = source_name.clone();
+    }
+
+    Ok(Resolved {
+        nodes,
+        path_updates,
+    })
 }
 
 fn has_filters(config: &AcquireConfig) -> bool {
@@ -85,38 +121,91 @@ async fn resolve_explicit(
     nodes: &[crate::acquire::config::NodeSelector],
     legacy_ids: &[String],
     namespaces: &NamespaceTable,
-) -> Result<Vec<SelectedNode>> {
+) -> Result<(Vec<SelectedNode>, Vec<(String, String)>)> {
     if nodes.is_empty() && legacy_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Parse + remap every selector to a concrete (live) NodeId, keeping any
-    // configured friendly name alongside it.
-    let mut parsed: Vec<(NodeId, Option<String>)> = Vec::with_capacity(nodes.len() + legacy_ids.len());
+    // configured friendly name, cached path, and original config id alongside.
+    struct Parsed {
+        id: NodeId,
+        configured_name: Option<String>,
+        cached_path: Option<String>,
+        config_id: Option<String>,
+    }
+    let mut parsed: Vec<Parsed> = Vec::with_capacity(nodes.len() + legacy_ids.len());
     for node in nodes {
         let id = remap_node_id(&node.id, node.namespace.as_deref(), namespaces)?;
-        parsed.push((id, node.name.clone()));
+        parsed.push(Parsed {
+            id,
+            configured_name: node.name.clone(),
+            cached_path: node.path.clone().filter(|s| !s.is_empty()),
+            config_id: Some(node.id.clone()),
+        });
     }
     for id in legacy_ids {
         // Legacy bare ids carry no namespace URI: use the literal index as-is.
         let node_id = remap_node_id(id, None, namespaces)?;
-        parsed.push((node_id, None));
-    }
-
-    let ids: Vec<NodeId> = parsed.iter().map(|(id, _)| id.clone()).collect();
-    let attrs = read_node_attributes(session, &ids).await?;
-    let mut out = Vec::with_capacity(parsed.len());
-    for ((id, configured_name), attr) in parsed.into_iter().zip(attrs) {
-        let name = configured_name
-            .or_else(|| attr.display_name.clone())
-            .unwrap_or_else(|| id.to_string());
-        out.push(SelectedNode {
-            path: name_or_id(&attr.display_name, &id),
-            name,
-            node_id: id,
+        parsed.push(Parsed {
+            id: node_id,
+            configured_name: None,
+            cached_path: None,
+            config_id: None,
         });
     }
-    Ok(out)
+
+    let ids: Vec<NodeId> = parsed.iter().map(|p| p.id.clone()).collect();
+    let attrs = read_node_attributes(session, &ids).await?;
+    let mut out = Vec::with_capacity(parsed.len());
+    let mut path_updates = Vec::new();
+    for (p, attr) in parsed.into_iter().zip(attrs) {
+        let name = p
+            .configured_name
+            .or_else(|| attr.display_name.clone())
+            .unwrap_or_else(|| p.id.to_string());
+
+        // Resolve the full browse path: use the cached value when present,
+        // otherwise reconstruct it from the server and remember it for caching.
+        let browse_path = match p.cached_path {
+            Some(path) => Some(path),
+            None => {
+                let leaf = attr
+                    .browse_name
+                    .clone()
+                    .or_else(|| attr.display_name.clone())
+                    .unwrap_or_else(|| p.id.to_string());
+                let reconstructed =
+                    crate::opcua::browse::reconstruct_browse_path(session, &p.id, &leaf).await?;
+                if let (Some(path), Some(config_id)) = (&reconstructed, &p.config_id) {
+                    path_updates.push((config_id.clone(), path.clone()));
+                }
+                reconstructed
+            }
+        };
+
+        let meta = SampleMeta {
+            data_type: data_type_string(
+                attr.data_type.as_ref().and_then(builtin_datatype_name),
+                attr.value_rank,
+            ),
+            engineering_units: None,
+            browse_name: attr.browse_name.clone(),
+            display_name: attr.display_name.clone(),
+            browse_path: browse_path.clone(),
+            namespace: namespaces.uri(p.id.namespace).map(str::to_string),
+            eu_range: None,
+            source_endpoint: None,
+            source_name: None,
+        };
+        out.push(SelectedNode {
+            path: browse_path.unwrap_or_else(|| name_or_id(&attr.display_name, &p.id)),
+            name,
+            node_id: p.id,
+            meta,
+        });
+    }
+    Ok((out, path_updates))
 }
 
 /// Resolve a node id string to a concrete [`NodeId`], remapping the namespace
@@ -187,16 +276,119 @@ async fn resolve_filtered(
     let mut nodes = Vec::new();
     while let Some(record) = rx.recv().await {
         match NodeId::from_str(&record.node_id) {
-            Ok(node_id) => nodes.push(SelectedNode {
-                name: measurement_name(&record),
-                path: record.browse_path,
-                node_id,
-            }),
+            Ok(node_id) => {
+                let meta = SampleMeta {
+                    data_type: data_type_string(
+                        record.datatype.as_deref(),
+                        record.value_rank,
+                    ),
+                    engineering_units: None,
+                    browse_name: non_empty(&record.browse_name),
+                    display_name: non_empty(&record.display_name),
+                    browse_path: non_empty(&record.browse_path),
+                    namespace: non_empty(&record.namespace_uri),
+                    eu_range: None,
+                    source_endpoint: None,
+                    source_name: None,
+                };
+                nodes.push(SelectedNode {
+                    name: measurement_name(&record),
+                    path: record.browse_path,
+                    node_id,
+                    meta,
+                });
+            }
             Err(_) => warn!(node_id = %record.node_id, "skipping unparseable node id"),
         }
     }
     let _ = engine_task.await;
     Ok(nodes)
+}
+
+/// `Some(s)` when the string is non-empty, else `None`.
+fn non_empty(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Build the normalized `dataType` string for output from an OPC UA builtin
+/// type name and value rank. Scalar primitives map via [`canonical_data_type`];
+/// arrays (`value_rank >= 0`) get a `[]` suffix. Non-builtin or unknown types
+/// yield `None` (rendered as `null`).
+fn data_type_string(builtin_name: Option<&str>, value_rank: Option<i32>) -> Option<String> {
+    let canonical = canonical_data_type(builtin_name?)?;
+    let is_array = value_rank.map(|r| r >= 0).unwrap_or(false);
+    if is_array {
+        Some(format!("{canonical}[]"))
+    } else {
+        Some(canonical.to_string())
+    }
+}
+
+/// Property kind folded into a parent node's metadata.
+#[derive(Debug, Clone, Copy)]
+enum PropKind {
+    EuRange,
+    EngineeringUnits,
+}
+
+/// Discover each node's `EURange` / `EngineeringUnits` properties, fold their
+/// decoded values into the parent's [`SampleMeta`], and drop any property that
+/// was also selected as a standalone node (so it is not emitted on its own).
+async fn enrich_metadata(session: &Session, nodes: &mut Vec<SelectedNode>) -> Result<()> {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<NodeId> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    let property_lists = browse_properties(session, &ids).await?;
+
+    // Plan the property value reads, remembering which parent + kind each one
+    // belongs to, and which node ids end up folded away.
+    let mut to_read: Vec<NodeId> = Vec::new();
+    let mut targets: Vec<(usize, PropKind)> = Vec::new();
+    let mut folded: HashSet<NodeId> = HashSet::new();
+    for (idx, refs) in property_lists.iter().enumerate() {
+        for reference in refs {
+            let browse_name = reference.browse_name.name.to_string();
+            let kind = match browse_name.as_str() {
+                "EURange" => PropKind::EuRange,
+                "EngineeringUnits" => PropKind::EngineeringUnits,
+                _ => continue,
+            };
+            let prop_id = reference.node_id.node_id.clone();
+            folded.insert(prop_id.clone());
+            to_read.push(prop_id);
+            targets.push((idx, kind));
+        }
+    }
+
+    if !to_read.is_empty() {
+        let values = read_data_values(session, &to_read).await?;
+        for ((idx, kind), dv) in targets.into_iter().zip(values.iter()) {
+            match kind {
+                PropKind::EuRange => {
+                    if let Some(range) = range_from_data_value(dv) {
+                        nodes[idx].meta.eu_range = Some(range);
+                    }
+                }
+                PropKind::EngineeringUnits => {
+                    if let Some(label) = eu_label_from_data_value(dv) {
+                        nodes[idx].meta.engineering_units = Some(label);
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove nodes that are themselves a folded property of another selection.
+    if !folded.is_empty() {
+        nodes.retain(|n| !folded.contains(&n.node_id));
+    }
+    Ok(())
 }
 
 /// Choose a measurement name for a discovered record (display name, else the

@@ -97,6 +97,10 @@ impl AcquireConfig {
 pub struct ConnectionConfig {
     /// Endpoint URL, e.g. `opc.tcp://host:4840`.
     pub endpoint: Option<String>,
+    /// Optional human-readable name for this connection / data source. Surfaced
+    /// in the output as `meta.source.name` so downstream consumers can identify
+    /// where the data came from.
+    pub name: Option<String>,
     /// Username for user/password authentication.
     pub user: Option<String>,
     /// Password (supports `env:VAR`).
@@ -272,6 +276,11 @@ pub struct NodeSelector {
     /// Friendly display name (used as the measurement name in output).
     #[serde(default)]
     pub name: Option<String>,
+    /// Cached full browse path (e.g. `Boiler #1/LX001/ControlOut`). When set it
+    /// is used directly; when absent it is reconstructed from the server at
+    /// startup and (for file configs) written back here for later runs.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// `[output]` table.
@@ -285,6 +294,22 @@ pub struct OutputConfig {
     pub file: Option<PathBuf>,
     /// MQTT topic to prefix each line with (for piping to `tedge mqtt pub`).
     pub topic: Option<String>,
+    /// How much descriptive context to attach to each sample.
+    #[serde(default)]
+    pub metadata: MetadataMode,
+}
+
+/// Controls whether per-sample descriptive context (browse path, browse name,
+/// display name, namespace, engineering range/units) is included in the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetadataMode {
+    /// Attach metadata. For `ndjson`/`json`/`csv` the fields are flattened into
+    /// each record; for `tedge` they are nested under a `meta` object.
+    #[default]
+    Nested,
+    /// Omit all metadata (strict thin-edge.io measurement output).
+    Off,
 }
 
 /// Output encoding for acquired data.

@@ -43,7 +43,7 @@ pub async fn run(args: AcquireArgs, cancel: Arc<AtomicBool>) -> Result<()> {
 
     for (path, config) in configs {
         info!(config = %path.display(), "starting acquisition");
-        acquire::run(config, args.duration, cancel.clone()).await?;
+        acquire::run(config, args.duration, Some(path.as_path()), cancel.clone()).await?;
     }
 
     Ok(())

@@ -10,54 +10,64 @@ endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer"
 id = "ns=4;i=1244"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "Output"
+path = "Server/Boilers/Boiler #1/PipeX001/FTX001/Output"
 
 [[selection.node]]
 id = "ns=4;i=1247"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "EURange"
+path = "Server/Boilers/Boiler #1/PipeX001/FTX001/Output/EURange"
 
 [[selection.node]]
 id = "ns=4;i=1274"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "Measurement"
+path = "Server/Boilers/Boiler #1/FCX001/Measurement"
 
 [[selection.node]]
 id = "ns=4;i=1275"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "SetPoint"
+path = "Server/Boilers/Boiler #1/FCX001/SetPoint"
 
 [[selection.node]]
 id = "ns=4;i=1276"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "ControlOut"
+path = "Server/Boilers/Boiler #1/FCX001/ControlOut"
 
 [[selection.node]]
 id = "ns=4;i=1267"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "Output"
+path = "Server/Boilers/Boiler #1/PipeX002/FTX002/Output"
 
 [[selection.node]]
 id = "ns=4;i=1270"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "EURange"
+path = "Server/Boilers/Boiler #1/PipeX002/FTX002/Output/EURange"
 
 [[selection.node]]
 id = "ns=4;i=1278"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "Measurement"
+path = "Server/Boilers/Boiler #1/LCX001/Measurement"
 
 [[selection.node]]
 id = "ns=4;i=1279"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "SetPoint"
+path = "Server/Boilers/Boiler #1/LCX001/SetPoint"
 
 [[selection.node]]
 id = "ns=4;i=1280"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "ControlOut"
+path = "Server/Boilers/Boiler #1/LCX001/ControlOut"
 
 [output]
-format = "tedge"
+format = "ndjson"
 
 [[task]]
 mode = "poll"

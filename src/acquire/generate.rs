@@ -51,6 +51,8 @@ pub struct GenNode {
     pub namespace: Option<String>,
     /// Friendly display name.
     pub name: Option<String>,
+    /// Cached full browse path, when known.
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +90,8 @@ struct GenNodeToml {
     namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 impl From<&GenNode> for GenNodeToml {
@@ -96,6 +100,7 @@ impl From<&GenNode> for GenNodeToml {
             id: n.id.clone(),
             namespace: n.namespace.clone().filter(|s| !s.is_empty()),
             name: n.name.clone().filter(|s| !s.is_empty()),
+            path: n.path.clone().filter(|s| !s.is_empty()),
         }
     }
 }
@@ -208,9 +213,46 @@ pub fn update_selection_in_toml(original: &str, nodes: &[GenNode]) -> Result<Str
         if let Some(name) = toml.name {
             t["name"] = toml_edit::value(name);
         }
+        if let Some(path) = toml.path {
+            t["path"] = toml_edit::value(path);
+        }
         tables.push(t);
     }
     selection.insert("node", Item::ArrayOfTables(tables));
+
+    Ok(doc.to_string())
+}
+
+/// Add a cached `path` to existing `[[selection.node]]` entries, matching by the
+/// node's `id` field. Preserves all other content (formatting, comments, tasks).
+/// `updates` is a list of `(node id, browse path)` pairs.
+pub fn update_node_paths_in_toml(original: &str, updates: &[(String, String)]) -> Result<String> {
+    use toml_edit::{value, DocumentMut};
+
+    if updates.is_empty() {
+        return Ok(original.to_string());
+    }
+
+    let mut doc: DocumentMut = original
+        .parse()
+        .map_err(|e: toml_edit::TomlError| ScanError::Export(e.to_string()))?;
+
+    let Some(nodes) = doc
+        .get_mut("selection")
+        .and_then(|s| s.get_mut("node"))
+        .and_then(|n| n.as_array_of_tables_mut())
+    else {
+        return Ok(doc.to_string());
+    };
+
+    for table in nodes.iter_mut() {
+        let id = table.get("id").and_then(|v| v.as_str()).map(str::to_string);
+        if let Some(id) = id {
+            if let Some((_, path)) = updates.iter().find(|(uid, _)| uid == &id) {
+                table["path"] = value(path.clone());
+            }
+        }
+    }
 
     Ok(doc.to_string())
 }
@@ -225,6 +267,7 @@ mod tests {
             id: id.to_string(),
             namespace: namespace.map(str::to_string),
             name: name.map(str::to_string),
+            path: None,
         }
     }
 
@@ -336,5 +379,59 @@ mode = \"scan\"
         let parsed = AcquireConfig::from_toml(&updated).expect("re-parse");
         assert_eq!(parsed.selection.nodes.len(), 1);
         assert_eq!(parsed.selection.nodes[0].id, "i=2258");
+    }
+
+    #[test]
+    fn update_node_paths_caches_browse_path() {
+        let original = "\
+# keep me
+[connection]
+endpoint = \"opc.tcp://host:4840\"
+
+[[selection.node]]
+id = \"ns=4;i=1276\"
+namespace = \"urn:boiler\"
+name = \"ControlOut\"
+
+[[selection.node]]
+id = \"ns=4;i=1244\"
+name = \"Output\"
+
+[output]
+format = \"ndjson\"
+
+[[task]]
+mode = \"poll\"
+interval = \"1s\"
+";
+        let updated = update_node_paths_in_toml(
+            original,
+            &[
+                ("ns=4;i=1276".to_string(), "Boiler #1/LX001/ControlOut".to_string()),
+                ("ns=4;i=1244".to_string(), "Boiler #1/CC001/Output".to_string()),
+            ],
+        )
+        .expect("update paths");
+
+        assert!(updated.contains("# keep me"));
+        assert!(updated.contains("path = \"Boiler #1/LX001/ControlOut\""));
+        assert!(updated.contains("path = \"Boiler #1/CC001/Output\""));
+
+        let parsed = AcquireConfig::from_toml(&updated).expect("re-parse");
+        assert_eq!(
+            parsed.selection.nodes[0].path.as_deref(),
+            Some("Boiler #1/LX001/ControlOut")
+        );
+        assert_eq!(
+            parsed.selection.nodes[1].path.as_deref(),
+            Some("Boiler #1/CC001/Output")
+        );
+    }
+
+    #[test]
+    fn update_node_paths_noop_without_updates() {
+        let original = "[connection]\nendpoint = \"opc.tcp://host:4840\"\n";
+        let updated = update_node_paths_in_toml(original, &[]).expect("noop");
+        assert_eq!(updated, original);
     }
 }

@@ -27,15 +27,18 @@ use crate::subscription::{self, SubscriptionParams};
 
 use config::{AcquireConfig, TaskConfig};
 use selection::SelectedNode;
-use sink::{Sample, Sink};
+use sink::{Sample, SampleMeta, Sink};
 
 /// Run a single acquisition config to completion.
 ///
 /// `duration` optionally bounds continuous tasks (poll/subscribe); one-shot
-/// tasks (scan/history) always run to completion regardless.
+/// tasks (scan/history) always run to completion regardless. `config_path`, when
+/// given, is the file the config was loaded from; reconstructed browse paths are
+/// cached back into it.
 pub async fn run(
     config: AcquireConfig,
     duration: Option<Duration>,
+    config_path: Option<&std::path::Path>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     let connection_args = config.connection_args()?;
@@ -53,7 +56,25 @@ pub async fn run(
         .iter()
         .any(|t| !matches!(t, TaskConfig::Scan { .. }));
     let nodes = if needs_nodes {
-        selection::resolve(&session, &config, &namespaces, cancel.clone()).await?
+        let resolved =
+            selection::resolve(&session, &config, &namespaces, conn.endpoint(), cancel.clone())
+                .await?;
+        // Cache any reconstructed browse paths back into the source config so
+        // later runs can skip the inverse browse.
+        if let Some(path) = config_path {
+            if !resolved.path_updates.is_empty() {
+                if let Err(e) = persist_node_paths(path, &resolved.path_updates) {
+                    warn!(error = %e, "failed to cache browse paths into config");
+                } else {
+                    info!(
+                        count = resolved.path_updates.len(),
+                        config = %path.display(),
+                        "cached reconstructed browse paths into config"
+                    );
+                }
+            }
+        }
+        resolved.nodes
     } else {
         Vec::new()
     };
@@ -239,6 +260,8 @@ async fn run_poll(
         return;
     }
     let node_ids: Vec<NodeId> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    let metas: Vec<Arc<SampleMeta>> =
+        nodes.iter().map(|n| Arc::new(n.meta.clone())).collect();
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -253,13 +276,16 @@ async fn run_poll(
 
         match read_readings(session, &node_ids).await {
             Ok(readings) => {
-                for (node, reading) in nodes.iter().zip(readings.iter()) {
+                for ((node, reading), meta) in
+                    nodes.iter().zip(readings.iter()).zip(metas.iter())
+                {
                     let sample = Sample {
                         name: node.name.clone(),
                         node_id: node.node_id.to_string(),
                         value: reading.value.clone(),
                         time: reading.best_time(),
                         status: reading.status.clone(),
+                        meta: meta.clone(),
                     };
                     if let Err(e) = sink.emit_sample(&sample) {
                         warn!(error = %e, "failed to emit poll sample");
@@ -292,6 +318,7 @@ async fn run_history(
     };
 
     for node in nodes {
+        let meta = Arc::new(node.meta.clone());
         match history::read_raw(session, &node.node_id, &query).await {
             Ok(readings) => {
                 for reading in &readings {
@@ -301,12 +328,33 @@ async fn run_history(
                         value: reading.value.clone(),
                         time: reading.best_time(),
                         status: reading.status.clone(),
+                        meta: meta.clone(),
                     };
                     sink.emit_sample(&sample)?;
                 }
             }
             Err(e) => warn!(node = %node.node_id, error = %e, "history read failed"),
         }
+    }
+    Ok(())
+}
+
+/// Write reconstructed browse paths back into the `[[selection.node]]` entries
+/// of an existing config file, preserving its formatting and comments.
+fn persist_node_paths(
+    path: &std::path::Path,
+    updates: &[(String, String)],
+) -> Result<()> {
+    let original = std::fs::read_to_string(path).map_err(|e| ScanError::Config {
+        path: path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    let updated = generate::update_node_paths_in_toml(&original, updates)?;
+    if updated != original {
+        std::fs::write(path, updated).map_err(|e| ScanError::Config {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
     }
     Ok(())
 }

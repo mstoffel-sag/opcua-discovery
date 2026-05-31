@@ -12,9 +12,86 @@ use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 
-use crate::acquire::config::{OutputConfig, OutputFormat};
+use crate::acquire::config::{MetadataMode, OutputConfig, OutputFormat};
 use crate::error::{Result, ScanError};
 use crate::export::record::NodeRecord;
+
+/// Descriptive context about a sampled data point, attached to every sample so
+/// downstream consumers can interpret it without a separate lookup.
+#[derive(Debug, Clone, Default)]
+pub struct SampleMeta {
+    /// Normalized, cross-platform data type name (e.g. `float64`), when the
+    /// node's declared type maps to a known scalar primitive.
+    pub data_type: Option<String>,
+    /// Engineering units label folded in from the node's `EngineeringUnits`
+    /// property, when present. Rendered at the top level as `units`.
+    pub engineering_units: Option<String>,
+    /// Browse name (namespace-qualified text).
+    pub browse_name: Option<String>,
+    /// Display name.
+    pub display_name: Option<String>,
+    /// Full browse path (URI-qualified), when known.
+    pub browse_path: Option<String>,
+    /// Namespace URI of the node.
+    pub namespace: Option<String>,
+    /// Engineering range (low, high) folded in from the node's `EURange`
+    /// property, when present.
+    pub eu_range: Option<(f64, f64)>,
+    /// Connection endpoint URL the data originated from.
+    pub source_endpoint: Option<String>,
+    /// Human-readable connection / source name (from `[connection] name`).
+    pub source_name: Option<String>,
+}
+
+impl SampleMeta {
+    /// Render the *descriptive* metadata (browse/display name, path, namespace,
+    /// engineering range) as a JSON object with only the populated sub-keys.
+    /// Type and units are surfaced at the top level instead.
+    fn descriptive_json(&self) -> Value {
+        let mut map = Map::new();
+        if let Some(v) = &self.browse_name {
+            map.insert("browseName".to_string(), Value::String(v.clone()));
+        }
+        if let Some(v) = &self.display_name {
+            map.insert("displayName".to_string(), Value::String(v.clone()));
+        }
+        if let Some(v) = &self.browse_path {
+            map.insert("browsePath".to_string(), Value::String(v.clone()));
+        }
+        if let Some(v) = &self.namespace {
+            map.insert("namespace".to_string(), Value::String(v.clone()));
+        }
+        if let Some((low, high)) = self.eu_range {
+            let mut range = Map::new();
+            range.insert("low".to_string(), json_number(low));
+            range.insert("high".to_string(), json_number(high));
+            map.insert("euRange".to_string(), Value::Object(range));
+        }
+        if self.source_endpoint.is_some() || self.source_name.is_some() {
+            let mut source = Map::new();
+            if let Some(v) = &self.source_endpoint {
+                source.insert("endpoint".to_string(), Value::String(v.clone()));
+            }
+            if let Some(v) = &self.source_name {
+                source.insert("name".to_string(), Value::String(v.clone()));
+            }
+            map.insert("source".to_string(), Value::Object(source));
+        }
+        Value::Object(map)
+    }
+
+    /// The output key for this data point: the full browse path when known,
+    /// otherwise the supplied fallback measurement name.
+    fn output_key<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.browse_path.as_deref().unwrap_or(fallback)
+    }
+}
+
+fn json_number(n: f64) -> Value {
+    serde_json::Number::from_f64(n)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
+}
 
 /// A single time-series sample produced by a poll/subscribe/history task.
 #[derive(Debug, Clone)]
@@ -29,12 +106,15 @@ pub struct Sample {
     pub time: Option<String>,
     /// Status code string, when not Good.
     pub status: Option<String>,
+    /// Descriptive context about the data point.
+    pub meta: std::sync::Arc<SampleMeta>,
 }
 
 /// Shared, thread-safe output sink.
 pub struct Sink {
     format: OutputFormat,
     topic: Option<String>,
+    metadata: MetadataMode,
     state: Mutex<State>,
 }
 
@@ -54,6 +134,7 @@ impl Sink {
         Ok(Sink {
             format: output.format,
             topic: output.topic.clone(),
+            metadata: output.metadata,
             state: Mutex::new(State {
                 writer,
                 buffer: Vec::new(),
@@ -66,15 +147,19 @@ impl Sink {
         let mut state = self.lock();
         match self.format {
             OutputFormat::Tedge => {
-                let obj = tedge_object(sample);
+                let obj = tedge_object(sample, self.metadata);
                 self.write_line(&mut state, &obj)
             }
             OutputFormat::Ndjson => {
-                let obj = sample_object(sample);
+                let obj = sample_object(sample, self.metadata, false);
                 self.write_line(&mut state, &obj)
             }
-            OutputFormat::Json | OutputFormat::Csv => {
-                state.buffer.push(sample_object(sample));
+            OutputFormat::Json => {
+                state.buffer.push(sample_object(sample, self.metadata, false));
+                Ok(())
+            }
+            OutputFormat::Csv => {
+                state.buffer.push(sample_object(sample, self.metadata, true));
                 Ok(())
             }
         }
@@ -133,28 +218,89 @@ impl Sink {
 }
 
 /// thin-edge.io measurement shape: `{ "time": ..., "<name>": <value> }`.
-fn tedge_object(sample: &Sample) -> Value {
+///
+/// With [`MetadataMode::Nested`] the descriptive context is attached under a
+/// sibling `meta` object, and the data type and units are nested there too
+/// (placing extra string fields at the top level would break a strict
+/// thin-edge measurement). Use [`MetadataMode::Off`] to keep the output
+/// strictly thin-edge compatible.
+fn tedge_object(sample: &Sample, metadata: MetadataMode) -> Value {
     let mut map = Map::new();
     if let Some(time) = &sample.time {
         map.insert("time".to_string(), Value::String(time.clone()));
     }
-    map.insert(sample.name.clone(), sample.value.clone());
+    let key = sample.meta.output_key(&sample.name).to_string();
+    map.insert(key, sample.value.clone());
+    if metadata == MetadataMode::Nested {
+        let mut meta = match sample.meta.descriptive_json() {
+            Value::Object(m) => m,
+            _ => Map::new(),
+        };
+        if let Some(dt) = &sample.meta.data_type {
+            meta.insert("dataType".to_string(), Value::String(dt.clone()));
+        }
+        if let Some(units) = &sample.meta.engineering_units {
+            meta.insert("units".to_string(), Value::String(units.clone()));
+        }
+        if !meta.is_empty() {
+            map.insert("meta".to_string(), Value::Object(meta));
+        }
+    }
     Value::Object(map)
 }
 
-/// Generic sample shape used for json/ndjson/csv.
-fn sample_object(sample: &Sample) -> Value {
+/// Fixed-schema record used for json/ndjson/csv.
+///
+/// In [`MetadataMode::Nested`] every top-level key is always present (with
+/// `null` where a value is absent) so downstream parsers see a stable schema:
+/// `time, key, value, dataType, nodeId, units, status, meta`. When
+/// `flatten_meta` is set (csv), the descriptive `meta` sub-keys are spread as
+/// top-level columns instead of being nested. [`MetadataMode::Off`] emits a
+/// reduced set without type/units/meta.
+fn sample_object(sample: &Sample, metadata: MetadataMode, flatten_meta: bool) -> Value {
     let mut map = Map::new();
-    if let Some(time) = &sample.time {
-        map.insert("time".to_string(), Value::String(time.clone()));
-    }
-    map.insert("name".to_string(), Value::String(sample.name.clone()));
-    map.insert("node_id".to_string(), Value::String(sample.node_id.clone()));
+    let time = sample
+        .time
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    map.insert("time".to_string(), time);
+    map.insert(
+        "key".to_string(),
+        Value::String(sample.meta.output_key(&sample.name).to_string()),
+    );
     map.insert("value".to_string(), sample.value.clone());
-    if let Some(status) = &sample.status {
-        map.insert("status".to_string(), Value::String(status.clone()));
+
+    if metadata == MetadataMode::Off {
+        map.insert("nodeId".to_string(), Value::String(sample.node_id.clone()));
+        map.insert("status".to_string(), opt_string(&sample.status));
+        return Value::Object(map);
+    }
+
+    map.insert("dataType".to_string(), opt_string(&sample.meta.data_type));
+    map.insert("nodeId".to_string(), Value::String(sample.node_id.clone()));
+    map.insert(
+        "units".to_string(),
+        opt_string(&sample.meta.engineering_units),
+    );
+    map.insert("status".to_string(), opt_string(&sample.status));
+
+    let descriptive = sample.meta.descriptive_json();
+    if flatten_meta {
+        if let Value::Object(meta) = descriptive {
+            for (k, v) in meta {
+                map.entry(k).or_insert(v);
+            }
+        }
+    } else {
+        map.insert("meta".to_string(), descriptive);
     }
     Value::Object(map)
+}
+
+/// Render an optional string as a JSON string or explicit `null`.
+fn opt_string(value: &Option<String>) -> Value {
+    value.clone().map(Value::String).unwrap_or(Value::Null)
 }
 
 /// Write buffered JSON objects as CSV, using the union of keys (in first-seen

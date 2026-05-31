@@ -241,6 +241,33 @@ pub fn builtin_datatype_name(node_id: &NodeId) -> Option<&'static str> {
     })
 }
 
+/// Map an OPC UA builtin data-type name (from [`builtin_datatype_name`]) to a
+/// normalized, cross-platform type name (e.g. `Double` -> `float64`).
+///
+/// Returns `None` for anything that is not a concrete scalar primitive
+/// (abstract base types, structures, and custom types), so callers can render
+/// an explicit `null` rather than a misleading type.
+pub fn canonical_data_type(builtin_name: &str) -> Option<&'static str> {
+    Some(match builtin_name {
+        "Boolean" => "bool",
+        "SByte" => "int8",
+        "Byte" => "uint8",
+        "Int16" => "int16",
+        "UInt16" => "uint16",
+        "Int32" => "int32",
+        "UInt32" => "uint32",
+        "Int64" => "int64",
+        "UInt64" => "uint64",
+        "Float" => "float32",
+        "Double" => "float64",
+        "String" => "string",
+        "DateTime" => "datetime",
+        "Guid" => "guid",
+        "ByteString" => "bytes",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +279,17 @@ mod tests {
         assert_eq!(builtin_datatype_name(&double), Some("Double"));
         let custom = NodeId::new(2, 5000u32);
         assert_eq!(builtin_datatype_name(&custom), None);
+    }
+
+    #[test]
+    fn canonical_data_type_names() {
+        assert_eq!(canonical_data_type("Double"), Some("float64"));
+        assert_eq!(canonical_data_type("Float"), Some("float32"));
+        assert_eq!(canonical_data_type("Int32"), Some("int32"));
+        assert_eq!(canonical_data_type("Boolean"), Some("bool"));
+        assert_eq!(canonical_data_type("ByteString"), Some("bytes"));
+        assert_eq!(canonical_data_type("Structure"), None);
+        assert_eq!(canonical_data_type("Number"), None);
     }
 
     #[test]

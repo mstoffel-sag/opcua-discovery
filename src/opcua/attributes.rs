@@ -23,6 +23,8 @@ pub struct NodeAttributes {
     pub node_class: Option<NodeClass>,
     /// Display name.
     pub display_name: Option<String>,
+    /// Browse name (namespace-qualified text, without the index prefix).
+    pub browse_name: Option<String>,
     /// Description.
     pub description: Option<String>,
     /// DataType node id (for Variables / VariableTypes).
@@ -62,6 +64,7 @@ impl NodeAttributes {
 const REQUESTED: &[AttributeId] = &[
     AttributeId::NodeClass,
     AttributeId::DisplayName,
+    AttributeId::BrowseName,
     AttributeId::Description,
     AttributeId::DataType,
     AttributeId::ValueRank,
@@ -125,6 +128,14 @@ fn parse_attributes(chunk: &[DataValue]) -> NodeAttributes {
             AttributeId::DisplayName => {
                 if let Variant::LocalizedText(t) = value {
                     attrs.display_name = Some(t.text.to_string());
+                }
+            }
+            AttributeId::BrowseName => {
+                if let Variant::QualifiedName(q) = value {
+                    let text = q.name.to_string();
+                    if !text.is_empty() {
+                        attrs.browse_name = Some(text);
+                    }
                 }
             }
             AttributeId::Description => {
