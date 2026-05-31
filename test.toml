@@ -7,64 +7,364 @@ endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer"
 [selection]
 
 [[selection.node]]
-id = "ns=4;i=1244"
-namespace = "http://opcfoundation.org/UA/Boiler/"
-name = "Output"
-path = "Server/Boilers/Boiler #1/PipeX001/FTX001/Output"
-
-[[selection.node]]
-id = "ns=4;i=1247"
-namespace = "http://opcfoundation.org/UA/Boiler/"
-name = "EURange"
-path = "Server/Boilers/Boiler #1/PipeX001/FTX001/Output/EURange"
-
-[[selection.node]]
 id = "ns=4;i=1274"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "Measurement"
-path = "Server/Boilers/Boiler #1/FCX001/Measurement"
+path = "FCX001/Measurement"
 
 [[selection.node]]
 id = "ns=4;i=1275"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "SetPoint"
-path = "Server/Boilers/Boiler #1/FCX001/SetPoint"
+path = "FCX001/SetPoint"
 
 [[selection.node]]
 id = "ns=4;i=1276"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "ControlOut"
-path = "Server/Boilers/Boiler #1/FCX001/ControlOut"
-
-[[selection.node]]
-id = "ns=4;i=1267"
-namespace = "http://opcfoundation.org/UA/Boiler/"
-name = "Output"
-path = "Server/Boilers/Boiler #1/PipeX002/FTX002/Output"
-
-[[selection.node]]
-id = "ns=4;i=1270"
-namespace = "http://opcfoundation.org/UA/Boiler/"
-name = "EURange"
-path = "Server/Boilers/Boiler #1/PipeX002/FTX002/Output/EURange"
+path = "FCX001/ControlOut"
 
 [[selection.node]]
 id = "ns=4;i=1278"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "Measurement"
-path = "Server/Boilers/Boiler #1/LCX001/Measurement"
+path = "LCX001/Measurement"
 
 [[selection.node]]
 id = "ns=4;i=1279"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "SetPoint"
-path = "Server/Boilers/Boiler #1/LCX001/SetPoint"
+path = "LCX001/SetPoint"
 
 [[selection.node]]
 id = "ns=4;i=1280"
 namespace = "http://opcfoundation.org/UA/Boiler/"
 name = "ControlOut"
-path = "Server/Boilers/Boiler #1/LCX001/ControlOut"
+path = "LCX001/ControlOut"
+
+[[selection.node]]
+id = "ns=4;i=1282"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Input1"
+path = "CCX001/Input1"
+
+[[selection.node]]
+id = "ns=4;i=1283"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Input2"
+path = "CCX001/Input2"
+
+[[selection.node]]
+id = "ns=4;i=1284"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Input3"
+path = "CCX001/Input3"
+
+[[selection.node]]
+id = "ns=4;i=1285"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "ControlOut"
+path = "CCX001/ControlOut"
+
+[[selection.node]]
+id = "ns=4;i=1286"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Description"
+path = "CCX001/Description"
+
+[[selection.node]]
+id = "ns=4;i=1348"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "UpdateRate"
+path = "Simulation/UpdateRate"
+
+[[selection.node]]
+id = "ns=4;i=1299"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Deletable"
+path = "Simulation/Deletable"
+
+[[selection.node]]
+id = "ns=4;i=1300"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "AutoDelete"
+path = "Simulation/AutoDelete"
+
+[[selection.node]]
+id = "ns=4;i=1301"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "RecycleCount"
+path = "Simulation/RecycleCount"
+
+[[selection.node]]
+id = "ns=4;i=1288"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "CurrentState"
+path = "Simulation/CurrentState"
+
+[[selection.node]]
+id = "ns=4;i=1293"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "LastTransition"
+path = "Simulation/LastTransition"
+
+[[selection.node]]
+id = "ns=4;i=1244"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Output"
+path = "PipeX001/FTX001/Output"
+
+[[selection.node]]
+id = "ns=4;i=1251"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Input"
+path = "PipeX001/ValveX001/Input"
+
+[[selection.node]]
+id = "ns=4;i=1267"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Output"
+path = "PipeX002/FTX002/Output"
+
+[[selection.node]]
+id = "ns=4;i=1259"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Output"
+path = "DrumX001/LIX001/Output"
+
+[[selection.node]]
+id = "ns=4;i=1289"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Id"
+path = "Simulation/CurrentState/Id"
+
+[[selection.node]]
+id = "ns=4;i=1247"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "EURange"
+path = "PipeX001/FTX001/Output/EURange"
+
+[[selection.node]]
+id = "ns=4;i=1294"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Id"
+path = "Simulation/LastTransition/Id"
+
+[[selection.node]]
+id = "ns=4;i=1291"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Number"
+path = "Simulation/CurrentState/Number"
+
+[[selection.node]]
+id = "ns=4;i=1296"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "Number"
+path = "Simulation/LastTransition/Number"
+
+[[selection.node]]
+id = "ns=4;i=1297"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "TransitionTime"
+path = "Simulation/LastTransition/TransitionTime"
+
+[[selection.node]]
+id = "ns=4;i=1270"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "EURange"
+path = "PipeX002/FTX002/Output/EURange"
+
+[[selection.node]]
+id = "ns=4;i=1254"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "EURange"
+path = "PipeX001/ValveX001/Input/EURange"
+
+[[selection.node]]
+id = "ns=4;i=1262"
+namespace = "http://opcfoundation.org/UA/Boiler/"
+name = "EURange"
+path = "DrumX001/LIX001/Output/EURange"
+
+[[selection.node]]
+id = "ns=5;i=22"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Measurement"
+path = "LCX001/Measurement"
+
+[[selection.node]]
+id = "ns=5;i=23"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "SetPoint"
+path = "LCX001/SetPoint"
+
+[[selection.node]]
+id = "ns=5;i=24"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "ControlOut"
+path = "LCX001/ControlOut"
+
+[[selection.node]]
+id = "ns=5;i=18"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Measurement"
+path = "FCX001/Measurement"
+
+[[selection.node]]
+id = "ns=5;i=19"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "SetPoint"
+path = "FCX001/SetPoint"
+
+[[selection.node]]
+id = "ns=5;i=20"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "ControlOut"
+path = "FCX001/ControlOut"
+
+[[selection.node]]
+id = "ns=5;i=26"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Input1"
+path = "CCX001/Input1"
+
+[[selection.node]]
+id = "ns=5;i=32"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "UpdateRate"
+path = "Simulation/UpdateRate"
+
+[[selection.node]]
+id = "ns=5;i=27"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Input2"
+path = "CCX001/Input2"
+
+[[selection.node]]
+id = "ns=5;i=28"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Input3"
+path = "CCX001/Input3"
+
+[[selection.node]]
+id = "ns=5;i=29"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "ControlOut"
+path = "CCX001/ControlOut"
+
+[[selection.node]]
+id = "ns=5;i=30"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Description"
+path = "CCX001/Description"
+
+[[selection.node]]
+id = "ns=5;i=38"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Deletable"
+path = "Simulation/Deletable"
+
+[[selection.node]]
+id = "ns=5;i=39"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "AutoDelete"
+path = "Simulation/AutoDelete"
+
+[[selection.node]]
+id = "ns=5;i=40"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "RecycleCount"
+path = "Simulation/RecycleCount"
+
+[[selection.node]]
+id = "ns=5;i=41"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "CurrentState"
+path = "Simulation/CurrentState"
+
+[[selection.node]]
+id = "ns=5;i=44"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "LastTransition"
+path = "Simulation/LastTransition"
+
+[[selection.node]]
+id = "ns=5;i=11"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Output"
+path = "DrumX001/LIX001/Output"
+
+[[selection.node]]
+id = "ns=5;i=7"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Input"
+path = "PipeX001/ValveX001/Input"
+
+[[selection.node]]
+id = "ns=5;i=4"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Output"
+path = "PipeX001/FTX001/Output"
+
+[[selection.node]]
+id = "ns=5;i=15"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Output"
+path = "PipeX002/FTX002/Output"
+
+[[selection.node]]
+id = "ns=5;i=42"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Id"
+path = "Simulation/CurrentState/Id"
+
+[[selection.node]]
+id = "ns=5;i=45"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Id"
+path = "Simulation/LastTransition/Id"
+
+[[selection.node]]
+id = "ns=5;i=43"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Number"
+path = "Simulation/CurrentState/Number"
+
+[[selection.node]]
+id = "ns=5;i=46"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "Number"
+path = "Simulation/LastTransition/Number"
+
+[[selection.node]]
+id = "ns=5;i=47"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "TransitionTime"
+path = "Simulation/LastTransition/TransitionTime"
+
+[[selection.node]]
+id = "ns=5;i=12"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "EURange"
+path = "DrumX001/LIX001/Output/EURange"
+
+[[selection.node]]
+id = "ns=5;i=5"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "EURange"
+path = "PipeX001/FTX001/Output/EURange"
+
+[[selection.node]]
+id = "ns=5;i=8"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "EURange"
+path = "PipeX001/ValveX001/Input/EURange"
+
+[[selection.node]]
+id = "ns=5;i=16"
+namespace = "http://opcfoundation.org/UA/Boiler/Instance"
+name = "EURange"
+path = "PipeX002/FTX002/Output/EURange"
 
 [output]
 format = "ndjson"

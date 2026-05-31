@@ -77,6 +77,14 @@ pub fn variant_to_json(v: &Variant) -> serde_json::Value {
             .map(Value::Number)
             .unwrap_or(Value::Null),
         Variant::String(s) => Value::String(s.to_string()),
+        Variant::LocalizedText(t) => Value::String(t.text.to_string()),
+        Variant::QualifiedName(q) => Value::String(q.name.to_string()),
+        Variant::ByteString(b) => Value::String(b.as_base64()),
+        Variant::DateTime(dt) => Value::String(dt.to_rfc3339()),
+        Variant::Guid(g) => Value::String(g.to_string()),
+        Variant::NodeId(id) => Value::String(id.to_string()),
+        Variant::ExpandedNodeId(id) => Value::String(id.to_string()),
+        Variant::XmlElement(x) => Value::String(x.to_string()),
         Variant::ExtensionObject(obj) => extension_object_to_json(obj),
         Variant::Array(arr) => {
             Value::Array(arr.values.iter().map(variant_to_json).collect())
