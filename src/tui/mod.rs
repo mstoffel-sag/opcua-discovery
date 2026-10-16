@@ -288,6 +288,10 @@ struct App {
     status: String,
     filter_query: String,
     filter_mode: bool,
+    /// When true, the `?` help overlay is shown and captures keys.
+    help_open: bool,
+    /// First visible line of the help overlay (when it is taller than the screen).
+    help_scroll: u16,
     /// When true, an acquire-config prompt is capturing "<mode> <interval>".
     acquire_mode: bool,
     /// Current text of the acquire-config prompt.
@@ -318,12 +322,12 @@ impl App {
     ) -> Self {
         let status = if let Some(path) = &options.source_config {
             format!(
-                "editing {} · selection 0/{} located · ↑/↓ move · space mark · S/P sub/poll · a save · q quit",
+                "editing {} · selection 0/{} located · a saves the selection",
                 path.display(),
                 options.selected_ids.len()
             )
         } else {
-            "↑/↓ move · →/← expand · space mark · S sub · P poll · V vars-only · v value · s validate · e export · a acquire · t library · / filter · q quit".into()
+            "ready — press ? for all keys".into()
         };
         Self {
             session,
@@ -338,6 +342,8 @@ impl App {
             status,
             filter_query: String::new(),
             filter_mode: false,
+            help_open: false,
+            help_scroll: 0,
             acquire_mode: false,
             acquire_query: String::new(),
             collect_pending: None,
@@ -473,7 +479,7 @@ impl App {
         self.located += 1;
         if let Some(path) = &self.options.source_config {
             self.status = format!(
-                "editing {} · selection {}/{} located · space mark · a save · q quit",
+                "editing {} · selection {}/{} located · a saves the selection",
                 path.display(),
                 self.located,
                 self.options.selected_ids.len()
@@ -618,6 +624,22 @@ impl App {
 
     /// Handle a key press.
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.help_open {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => self.help_open = false,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.quit = true;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if self.filter_mode {
             self.handle_filter_key(key);
             return Ok(());
@@ -629,6 +651,10 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('?') => {
+                self.help_open = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
@@ -1463,28 +1489,86 @@ impl App {
 
     /// Render the whole UI.
     fn render(&mut self, f: &mut Frame) {
-        // Reserve a progress row only while a background job is running.
-        let constraints = if self.job.is_some() {
-            vec![
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ]
-        } else {
-            vec![Constraint::Min(1), Constraint::Length(1)]
-        };
+        // Panes, key legend, a progress row only while a job runs, status.
+        let mut constraints = vec![Constraint::Min(1), Constraint::Length(1)];
+        if self.job.is_some() {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(1));
         let outer = Layout::vertical(constraints).split(f.area());
         let panes = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(outer[0]);
 
         self.render_tree(f, panes[0]);
         self.render_detail(f, panes[1]);
+        self.render_legend(f, outer[1]);
         if self.job.is_some() {
-            self.render_progress(f, outer[1]);
-            self.render_footer(f, outer[2]);
+            self.render_progress(f, outer[2]);
+            self.render_footer(f, outer[3]);
         } else {
-            self.render_footer(f, outer[1]);
+            self.render_footer(f, outer[2]);
         }
+        if self.help_open {
+            self.help_scroll = render_help(f, self.help_scroll);
+        }
+    }
+
+    /// The key legend entries of the current context, with priorities
+    /// (lower is more important), and whether `? help` is appended.
+    fn legend_entries(&self) -> (Vec<LegendEntry>, bool) {
+        if self.help_open {
+            return (vec![("?/Esc", "close help", 0), ("↑↓", "scroll", 1)], false);
+        }
+        if self.filter_mode {
+            return (
+                vec![
+                    ("type", "filter text", 0),
+                    ("⏎", "apply", 1),
+                    ("Esc", "clear", 2),
+                    ("⌫", "delete", 3),
+                ],
+                false,
+            );
+        }
+        if self.acquire_mode {
+            return (
+                vec![
+                    ("type", "poll 1s | subscribe 500ms", 0),
+                    ("⏎", "write config", 1),
+                    ("Esc", "cancel", 2),
+                ],
+                false,
+            );
+        }
+        let mut entries: Vec<LegendEntry> = Vec::new();
+        if self.job.is_some() {
+            entries.push(("x", "cancel", 0));
+        }
+        entries.extend(KEY_HELP.iter().filter_map(|k| k.legend));
+        (entries, true)
+    }
+
+    /// The legend row: `key action` pairs that fit the width.
+    fn render_legend(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let (entries, with_help) = self.legend_entries();
+        let kept = fit_legend(&entries, with_help, area.width as usize);
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, (key, label)) in kept.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                *key,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {label}"),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// Render an animated progress bar for the active background job.
@@ -1663,6 +1747,296 @@ impl App {
         )));
         f.render_widget(footer, area);
     }
+}
+
+/// A legend entry: key, short action, priority (lower is more important).
+type LegendEntry = (&'static str, &'static str, u8);
+
+/// One key binding, shown in the `?` overlay and, when `legend` is set, in the
+/// key legend row.
+struct KeyHelp {
+    group: &'static str,
+    key: &'static str,
+    description: &'static str,
+    /// Legend key, short action and priority.
+    legend: Option<LegendEntry>,
+}
+
+/// Every key of the explorer while browsing, in display order. The legend and
+/// the help overlay are both rendered from this table.
+const KEY_HELP: &[KeyHelp] = &[
+    KeyHelp {
+        group: "Navigation",
+        key: "↑ ↓  k j",
+        description: "move the selection",
+        legend: Some(("↑↓", "move", 1)),
+    },
+    KeyHelp {
+        group: "Navigation",
+        key: "→  ⏎  l",
+        description: "expand (browses on demand)",
+        legend: Some(("→", "expand", 2)),
+    },
+    KeyHelp {
+        group: "Navigation",
+        key: "←  h",
+        description: "collapse / go to parent",
+        legend: Some(("←", "collapse", 3)),
+    },
+    KeyHelp {
+        group: "Navigation",
+        key: "g  G",
+        description: "jump to top / bottom",
+        legend: None,
+    },
+    KeyHelp {
+        group: "Navigation",
+        key: "/",
+        description: "filter the tree by path",
+        legend: Some(("/", "filter", 7)),
+    },
+    KeyHelp {
+        group: "Navigation",
+        key: "V",
+        description: "only branches with variables",
+        legend: Some(("V", "vars only", 11)),
+    },
+    KeyHelp {
+        group: "Marking",
+        key: "space",
+        description: "mark / unmark with subtree",
+        legend: Some(("space", "mark", 4)),
+    },
+    KeyHelp {
+        group: "Marking",
+        key: "S",
+        description: "mark to subscribe (acquire)",
+        legend: Some(("S/P", "sub/poll mark", 12)),
+    },
+    KeyHelp {
+        group: "Marking",
+        key: "P",
+        description: "mark to poll (acquire)",
+        legend: None,
+    },
+    KeyHelp {
+        group: "Actions",
+        key: "t",
+        description: "tedge-dot library (--library)",
+        legend: Some(("t", "library", 5)),
+    },
+    KeyHelp {
+        group: "Actions",
+        key: "a",
+        description: "acquire config from marks",
+        legend: Some(("a", "acquire", 6)),
+    },
+    KeyHelp {
+        group: "Actions",
+        key: "e",
+        description: "export nodes (--file)",
+        legend: Some(("e", "export", 8)),
+    },
+    KeyHelp {
+        group: "Actions",
+        key: "v",
+        description: "read the selected value",
+        legend: Some(("v", "value", 9)),
+    },
+    KeyHelp {
+        group: "Actions",
+        key: "s",
+        description: "check it can be subscribed",
+        legend: Some(("s", "validate", 13)),
+    },
+    KeyHelp {
+        group: "Actions",
+        key: "x",
+        description: "cancel the running job",
+        legend: None,
+    },
+    KeyHelp {
+        group: "Other",
+        key: "?",
+        description: "show / hide this help",
+        legend: None,
+    },
+    KeyHelp {
+        group: "Other",
+        key: "q  Esc  Ctrl+C",
+        description: "quit",
+        legend: Some(("q", "quit", 10)),
+    },
+];
+
+/// What the mark column means.
+const MARK_HELP: &[(&str, &str)] = &[
+    ("[x]", "marked"),
+    ("[S]", "subscribe"),
+    ("[P]", "poll"),
+    ("[+]", "inside a marked node"),
+    ("[ ]", "not marked"),
+];
+
+/// The legend entries that fit `width`, most important first, shown in their
+/// original order and followed by `? help` when `with_help`.
+fn fit_legend(
+    entries: &[LegendEntry],
+    with_help: bool,
+    width: usize,
+) -> Vec<(&'static str, &'static str)> {
+    let cost = |key: &str, label: &str| key.chars().count() + 1 + label.chars().count() + 2;
+    let mut budget = width.saturating_sub(if with_help { cost("?", "help") } else { 0 });
+    let mut by_priority: Vec<usize> = (0..entries.len()).collect();
+    by_priority.sort_by_key(|&i| entries[i].2);
+    let mut keep = vec![false; entries.len()];
+    for i in by_priority {
+        let c = cost(entries[i].0, entries[i].1);
+        if c <= budget {
+            budget -= c;
+            keep[i] = true;
+        }
+    }
+    let mut kept: Vec<(&'static str, &'static str)> = entries
+        .iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(e, _)| (e.0, e.1))
+        .collect();
+    if with_help {
+        kept.push(("?", "help"));
+    }
+    kept
+}
+
+/// Width of the key column in the help overlay.
+const HELP_KEY_WIDTH: usize = 15;
+/// Width of one column of the help overlay (key + description).
+const HELP_COLUMN_WIDTH: usize = 46;
+
+/// One group of the help overlay as styled lines: a heading, then one line per key.
+fn help_group(group: &str) -> Vec<Vec<Span<'static>>> {
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let head_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = vec![vec![Span::styled(group.to_string(), head_style)]];
+    for k in KEY_HELP.iter().filter(|k| k.group == group) {
+        lines.push(vec![
+            Span::styled(format!("  {:<w$}", k.key, w = HELP_KEY_WIDTH), key_style),
+            Span::raw(k.description),
+        ]);
+    }
+    lines
+}
+
+/// Pad a line's spans with spaces to `width` characters.
+fn pad_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if len < width {
+        spans.push(Span::raw(" ".repeat(width - len)));
+    }
+    spans
+}
+
+/// The help overlay text: every binding by group, then the mark symbols. With
+/// `two_columns`, Navigation and Marking sit left of Actions and Other.
+fn help_lines(two_columns: bool) -> Vec<Line<'static>> {
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let head_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = Vec::new();
+    let column = |groups: &[&str]| -> Vec<Vec<Span<'static>>> {
+        let mut out = Vec::new();
+        for (i, g) in groups.iter().enumerate() {
+            if i > 0 {
+                out.push(Vec::new());
+            }
+            out.extend(help_group(g));
+        }
+        out
+    };
+    if two_columns {
+        let left = column(&["Navigation", "Marking"]);
+        let right = column(&["Actions", "Other"]);
+        for i in 0..left.len().max(right.len()) {
+            let mut spans = pad_spans(left.get(i).cloned().unwrap_or_default(), HELP_COLUMN_WIDTH);
+            spans.push(Span::raw("  "));
+            spans.extend(right.get(i).cloned().unwrap_or_default());
+            lines.push(Line::from(spans));
+        }
+    } else {
+        lines.extend(
+            column(&["Navigation", "Marking", "Actions", "Other"])
+                .into_iter()
+                .map(Line::from),
+        );
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Marks", head_style));
+    // As many marks per line as the box is wide.
+    let inner = if two_columns {
+        2 * HELP_COLUMN_WIDTH + 2
+    } else {
+        HELP_COLUMN_WIDTH
+    };
+    let mut marks: Vec<Span> = vec![Span::raw("  ")];
+    let mut used = 2;
+    for (mark, meaning) in MARK_HELP {
+        let entry = format!("{mark} {meaning}").chars().count();
+        if used > 2 && used + entry > inner {
+            lines.push(Line::from(std::mem::take(&mut marks)));
+            marks.push(Span::raw("  "));
+            used = 2;
+        }
+        marks.push(Span::styled(*mark, key_style));
+        marks.push(Span::raw(format!(" {meaning}   ")));
+        used += entry + 3;
+    }
+    lines.push(Line::from(marks));
+    lines
+}
+
+/// Draw the help overlay centered over the UI: two columns when they fit,
+/// scrolled by `scroll` lines when it is taller than the screen. Returns the
+/// scroll offset clamped to the content.
+fn render_help(f: &mut Frame, scroll: u16) -> u16 {
+    let area = f.area();
+    let two_columns = area.width as usize >= 2 * HELP_COLUMN_WIDTH + 4;
+    let lines = help_lines(two_columns);
+    let wanted = if two_columns {
+        2 * HELP_COLUMN_WIDTH + 4
+    } else {
+        HELP_COLUMN_WIDTH + 2
+    };
+    let width = (wanted as u16).min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let hidden = (lines.len() as u16 + 2).saturating_sub(height);
+    let scroll = scroll.min(hidden);
+    let title = if hidden > 0 {
+        " Keys — ↑↓ scroll · ? / Esc / q to close "
+    } else {
+        " Keys — ? / Esc / q to close "
+    };
+    let popup = ratatui::layout::Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        popup,
+    );
+    scroll
 }
 
 /// Walk the tree depth-first collecting visible (expanded-chain) node indices.
@@ -2031,5 +2405,102 @@ fn encoding_for(path: &std::path::Path) -> crate::cli::Encoding {
         Some("csv") => crate::cli::Encoding::Csv,
         Some("ndjson") => crate::cli::Encoding::Ndjson,
         _ => crate::cli::Encoding::Json,
+    }
+}
+
+#[cfg(test)]
+mod legend_tests {
+    use super::*;
+
+    fn browsing() -> Vec<LegendEntry> {
+        KEY_HELP.iter().filter_map(|k| k.legend).collect()
+    }
+
+    #[test]
+    fn wide_terminal_shows_every_legend_entry() {
+        let kept = fit_legend(&browsing(), true, 400);
+        assert_eq!(kept.len(), browsing().len() + 1);
+        assert_eq!(kept.last(), Some(&("?", "help")));
+    }
+
+    #[test]
+    fn narrow_terminal_keeps_help_and_the_most_important_keys() {
+        let kept = fit_legend(&browsing(), true, 60);
+        assert_eq!(kept.last(), Some(&("?", "help")));
+        assert!(kept.contains(&("↑↓", "move")) && kept.contains(&("space", "mark")));
+        assert!(!kept.contains(&("s", "validate")));
+        let width: usize = kept
+            .iter()
+            .map(|(k, l)| k.chars().count() + 1 + l.chars().count() + 2)
+            .sum();
+        assert!(width <= 60 + 2, "{kept:?}");
+    }
+
+    #[test]
+    fn tiny_terminal_still_shows_help() {
+        assert_eq!(fit_legend(&browsing(), true, 5), vec![("?", "help")]);
+    }
+
+    #[test]
+    fn overlay_lists_every_binding_and_mark() {
+        for two_columns in [false, true] {
+            let text: String = help_lines(two_columns)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect();
+            for k in KEY_HELP {
+                assert!(
+                    text.contains(k.key) && text.contains(k.description),
+                    "{}",
+                    k.key
+                );
+            }
+            for (mark, _) in MARK_HELP {
+                assert!(text.contains(mark), "{mark}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_lines_fit_their_box() {
+        let width = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        };
+        for (two, inner) in [
+            (true, 2 * HELP_COLUMN_WIDTH + 2),
+            (false, HELP_COLUMN_WIDTH),
+        ] {
+            for l in help_lines(two).iter() {
+                // Trailing padding is invisible.
+                let pad = l
+                    .spans
+                    .last()
+                    .map_or(0, |s| s.content.len() - s.content.trim_end().len());
+                assert!(
+                    width(l) - pad <= inner,
+                    "{} > {inner}: {l:?}",
+                    width(l) - pad
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_column_overlay_fits_a_24_line_terminal() {
+        // Borders take two rows; the legend and status rows stay visible below.
+        assert!(
+            help_lines(true).len() + 2 <= 22,
+            "{}",
+            help_lines(true).len()
+        );
     }
 }

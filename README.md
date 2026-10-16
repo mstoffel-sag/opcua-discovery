@@ -139,6 +139,10 @@ minimal on huge address spaces.
 opcua-scan browse opc.tcp://localhost:4840 --tui
 ```
 
+A key legend under the tree always shows the keys that apply right now (browsing, filter input,
+the acquire prompt, `x cancel` while a job runs); press `?` for an overlay with every key and the
+meaning of the mark symbols (`↑`/`↓` scroll it on small terminals, `?`/`Esc`/`q` close it).
+
 Keys:
 
 | Key | Action |
@@ -155,6 +159,7 @@ Keys:
 | `a` | Write an `acquire` config from the marked nodes |
 | `t` | Write the marked nodes as a tedge-dot point library (`--library`) |
 | `/` | Incremental path filter |
+| `?` | Show / hide all keys and mark symbols |
 | `g` / `G` | Jump to top / bottom |
 | `q` / `Esc` | Quit |
 
