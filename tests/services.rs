@@ -116,9 +116,10 @@ fn historizing_filter_finds_only_history_node() {
 #[test]
 fn writable_filter_returns_nothing_for_read_only_server() {
     let endpoint = common::start();
-    // Every fixture variable is read-only. Scope the query to the custom
-    // namespace so the server's built-in (ns 0) writable nodes do not count;
-    // the writable predicate must then yield an empty result set.
+    // Every Factory variable is read-only (Plant has a writable enum for the
+    // tedge-dot tests). Scope the query to Factory in the custom namespace so
+    // no other writable node counts; the writable predicate must then yield
+    // an empty result set.
     let out = run_cli_ok(&[
         "browse",
         &endpoint,
@@ -126,6 +127,8 @@ fn writable_filter_returns_nothing_for_read_only_server() {
         "unlimited",
         "--ns-uri",
         TEST_NS,
+        "--include",
+        "Factory/**",
         "--writable",
         "--output",
         "json",

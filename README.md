@@ -153,6 +153,7 @@ Keys:
 | `s` | Validate subscription for the selected variable |
 | `e` | Export the loaded nodes (uses `--file`, or `opcua-scan-export.json`) |
 | `a` | Write an `acquire` config from the marked nodes |
+| `t` | Write the marked nodes as a tedge-dot point library (`--library`) |
 | `/` | Incremental path filter |
 | `g` / `G` | Jump to top / bottom |
 | `q` / `Esc` | Quit |
@@ -162,6 +163,54 @@ mode. Nodes marked with `space` (auto) follow the config's default mode —
 subscribe when the server supports monitoring the node, otherwise poll.
 
 The terminal is always restored on exit, even on panic.
+
+---
+
+## tedge-dot point libraries
+
+opcua-scan can produce a [tedge-dot](https://github.com/thin-edge/tedge-dot) OPC UA **point
+library** (a `[library]` table plus `[[point]]` entries) from the nodes it discovers, and connect
+with the settings of a device in a tedge-dot connector config instead of its own flags.
+
+```bash
+# Connect exactly like the gateway's connector does (endpoint, security, user/password file,
+# the gateway's application certificate). CLI flags still win.
+opcua-scan connect --tedge-dot-config /etc/tedge/plugins/ot/opcua.toml --device plc-7
+
+# Write every variable and method below Line1 as a library (merges into acme-line.toml)
+opcua-scan browse --tedge-dot-config opcua.toml --device plc-7 --depth unlimited \
+    --include "Factory/Line1/**" --type Variable,Method --output tedge-dot --file acme-line.toml
+
+# Pick nodes interactively: mark with space, press t to write/merge point-library.toml
+opcua-scan browse --tedge-dot-config opcua.toml --device plc-7 --tui --library acme-line.toml
+```
+
+- **Points:** `id` (unique snake_case from the browse path), `name`, `description`, `datatype`
+  (Double → `float64`, DateTime/LocalizedText/Guid/... → `string`, ByteString → `bytes`, ...),
+  `access` (`read_write`/`write` from AccessLevel ∧ UserAccessLevel), `subscribe = false` for
+  readable nodes that are not subscribable, and `address = { node_id = ... }`.
+- **Custom datatypes** are read from the server (`DataTypeDefinition`, `HasSubtype`):
+  - a **structure** variable becomes one read-only point per mappable leaf field,
+    `address = { node_id = ..., field = "Motor.Current" }`, nested structures included;
+  - an **enumeration** becomes an `int32` point with `map.cases` from its values to its names
+    (`as = "string"` for codes the definition does not list);
+  - a **derived type** (e.g. a `Percent` subtype of Double) maps like its base type.
+- **Methods** become `access = "call_method"` points with
+  `address = { object_id, method_id, inputs = [...] }`, the inputs read from `InputArguments`.
+  Include them with `--type Variable,Method` (or no `--type`).
+- **Skipped:** arrays, array fields, abstract/unsupported types, inaccessible variables,
+  non-executable methods and methods with structure or array arguments; a new library lists
+  them in its header comment. An empty result is an error and writes nothing.
+- **Namespaces:** `[library] namespaces` records the server's namespace table, so tedge-dot
+  translates the ids if a server numbers its namespaces differently.
+- **Merging:** an existing library is edited in place: comments and hand-edited points are kept,
+  new nodes are appended (in the library's namespace numbering). In the TUI, the library's points
+  are pre-marked and a point is removed when its node is shown in the tree and unmarked.
+- `[library] type` comes from `--library-type`, else the `--tedge-dot-config` device's `type`.
+- From the connector config only the connection is used, with tedge-dot's rules:
+  `allow_deprecated_security` unlocks `Basic128Rsa15`/`Basic256`, and `allow_plaintext_password`
+  is required for an unprotected password. Server-certificate trust stays in opcua-scan's own
+  PKI (`--pki-dir`).
 
 ---
 
@@ -261,8 +310,9 @@ Globs use `/` as the path separator and support `*` (within a segment) and `**`
 | `--user <USER>` | Username for user/password auth. |
 | `--password <PASSWORD\|env:VAR>` | Password; use `env:VAR` to read from an env var, or omit to be prompted securely. Secrets are never logged. |
 | `--cert <FILE>` / `--key <FILE>` | Client certificate and private key. |
-| `--security-policy <POLICY>` | `None`, `Basic256Sha256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`. |
-| `--security-mode <MODE>` | `None`, `Sign`, `SignAndEncrypt`. |
+| `--security-policy <POLICY>` | `None`, `Basic128Rsa15`, `Basic256`, `Basic256Sha256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss` (any case; tedge-dot spellings such as `Aes128_Sha256_RsaOaep` and the policy URIs work too). |
+| `--security-mode <MODE>` | `None`, `Sign`, `SignAndEncrypt`. Default: `SignAndEncrypt` with a security policy, else `None`. |
+| `--allow-deprecated-security` | Required for the deprecated SHA-1 policies `Basic128Rsa15` and `Basic256`. |
 | `--trust-server` | Auto-trust the server certificate (**insecure**; lab use only). |
 | `--pki-dir <DIR>` | Client PKI directory (own cert, key, trusted certs). |
 | `--timeout <DURATION>` | Per-request timeout (default `10s`). |
@@ -277,6 +327,12 @@ opcua-scan browse opc.tcp://10.0.0.10:4840 \
   --security-policy Basic256Sha256 --security-mode SignAndEncrypt \
   --depth 3
 ```
+
+Every policy async-opcua implements is supported, with anonymous, username/password and X.509
+user identities. ECC policies are not available (neither async-opcua nor tedge-dot implements
+them). A password that would travel unprotected (a `None` channel, or a signed-only channel
+whose username token policy names `None`) is sent with a warning; with `--tedge-dot-config` it is
+refused unless the config sets `allow_plaintext_password = true`, as the connector does.
 
 ---
 

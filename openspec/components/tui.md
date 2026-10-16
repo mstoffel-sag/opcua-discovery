@@ -34,6 +34,7 @@
 | `s` | Validate subscription for selected variable |
 | `e` | Export loaded/marked nodes (uses `--file` or `opcua-scan-export.json`) |
 | `a` | Generate/update `acquire` config from marked variables |
+| `t` | Write/merge the tedge-dot point library (`--library`) from marked variables |
 | `x` | Cancel in-progress job |
 | `/` | Incremental path filter |
 | `g` / `G` | Jump top / bottom |
@@ -55,6 +56,11 @@ and acquire traverse into unmarked nodes only as needed.
 - **Acquire:** collect readable Variables under marks, then either `update_selection_in_toml`
   (editing an existing `source_config`) or `generate_toml` (new config); if editing, prompt for
   `<poll|subscribe> <interval>`. See [acquire.md](acquire.md) `generate.rs`.
+- **Library (`t`):** same background collection (`collect_job` yields Variables and Methods as
+  `(NodeRecord, mode)`; `CollectFor` says what it is for), then a discovery job
+  (`tedge_dot::schema::discover`, `JobMsg::LibraryReady`), then `tedge_dot::library::write`. The
+  main loop picks up a job started from a job message. The removal set is the
+  loaded Variables that are neither marked nor under a mark, computed when `t` is pressed.
 
 ## Integrations
 Uses `opcua::browse` (lazy children), `opcua::value` (preview), `subscription` (validate),

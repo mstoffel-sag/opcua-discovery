@@ -44,6 +44,8 @@ pub struct GenConnection {
     pub security_policy: Option<String>,
     /// Security mode name, if not the default `None`.
     pub security_mode: Option<String>,
+    /// Whether a deprecated security policy is allowed.
+    pub allow_deprecated_security: bool,
     /// Username, if user/password auth is in use (password is NOT written).
     pub user: Option<String>,
     /// PKI directory, if set.
@@ -91,6 +93,8 @@ struct GenConnectionToml {
     security_policy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     security_mode: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    allow_deprecated_security: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,6 +228,7 @@ pub fn generate_toml(
             trust_server: conn.trust_server,
             security_policy: conn.security_policy.clone(),
             security_mode: conn.security_mode.clone(),
+            allow_deprecated_security: conn.allow_deprecated_security,
             user: conn.user.clone(),
             pki_dir: conn.pki_dir.as_ref().map(|p| p.display().to_string()),
         },

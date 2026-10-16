@@ -219,10 +219,15 @@ pub struct ConnectionConfig {
     pub cert: Option<PathBuf>,
     /// Client private key (PEM).
     pub key: Option<PathBuf>,
-    /// Security policy: `None`, `Basic256Sha256`, `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss`.
+    /// Security policy: `None`, `Basic128Rsa15`, `Basic256`, `Basic256Sha256`,
+    /// `Aes128Sha256RsaOaep`, `Aes256Sha256RsaPss` (also tedge-dot names and URIs).
     pub security_policy: Option<String>,
-    /// Security mode: `None`, `Sign`, `SignAndEncrypt`.
+    /// Security mode: `None`, `Sign`, `SignAndEncrypt` (default: SignAndEncrypt
+    /// with a security policy).
     pub security_mode: Option<String>,
+    /// Allow the deprecated policies `Basic128Rsa15` and `Basic256`.
+    #[serde(default)]
+    pub allow_deprecated_security: bool,
     /// Automatically trust the server certificate (insecure).
     #[serde(default)]
     pub trust_server: bool,
@@ -247,11 +252,15 @@ impl ConnectionConfig {
             key: self.key.clone(),
             security_policy: parse_security_policy(self.security_policy.as_deref())?,
             security_mode: parse_security_mode(self.security_mode.as_deref())?,
+            allow_deprecated_security: self.allow_deprecated_security,
             trust_server: self.trust_server,
             pki_dir: self.pki_dir.clone(),
             timeout: self.timeout.unwrap_or_else(|| Duration::from_secs(10)),
             retry: self.retry.unwrap_or(3),
             cache: self.cache.clone(),
+            tedge_dot_config: None,
+            device: None,
+            extras: Default::default(),
         })
     }
 
@@ -284,9 +293,10 @@ impl ConnectionConfig {
         if args.security_policy == SecurityPolicyArg::None {
             args.security_policy = parse_security_policy(self.security_policy.as_deref())?;
         }
-        if args.security_mode == SecurityModeArg::None {
+        if args.security_mode.is_none() {
             args.security_mode = parse_security_mode(self.security_mode.as_deref())?;
         }
+        args.allow_deprecated_security |= self.allow_deprecated_security;
         if !args.trust_server {
             args.trust_server = self.trust_server;
         }
@@ -511,31 +521,18 @@ impl From<ScanStrategy> for Strategy {
 fn parse_security_policy(s: Option<&str>) -> Result<SecurityPolicyArg> {
     match s.map(str::trim) {
         None | Some("") => Ok(SecurityPolicyArg::None),
-        Some(v) if v.eq_ignore_ascii_case("none") => Ok(SecurityPolicyArg::None),
-        Some(v) if v.eq_ignore_ascii_case("Basic256Sha256") => {
-            Ok(SecurityPolicyArg::Basic256Sha256)
-        }
-        Some(v) if v.eq_ignore_ascii_case("Aes128Sha256RsaOaep") => {
-            Ok(SecurityPolicyArg::Aes128Sha256RsaOaep)
-        }
-        Some(v) if v.eq_ignore_ascii_case("Aes256Sha256RsaPss") => {
-            Ok(SecurityPolicyArg::Aes256Sha256RsaPss)
-        }
-        Some(v) => Err(ScanError::InvalidArgument(format!(
-            "invalid security_policy '{v}'"
-        ))),
+        Some(v) => SecurityPolicyArg::parse(v)
+            .ok_or_else(|| ScanError::InvalidArgument(format!("invalid security_policy '{v}'"))),
     }
 }
 
-fn parse_security_mode(s: Option<&str>) -> Result<SecurityModeArg> {
+/// An absent mode stays absent: the policy's default applies at connect.
+fn parse_security_mode(s: Option<&str>) -> Result<Option<SecurityModeArg>> {
     match s.map(str::trim) {
-        None | Some("") => Ok(SecurityModeArg::None),
-        Some(v) if v.eq_ignore_ascii_case("none") => Ok(SecurityModeArg::None),
-        Some(v) if v.eq_ignore_ascii_case("sign") => Ok(SecurityModeArg::Sign),
-        Some(v) if v.eq_ignore_ascii_case("SignAndEncrypt") => Ok(SecurityModeArg::SignAndEncrypt),
-        Some(v) => Err(ScanError::InvalidArgument(format!(
-            "invalid security_mode '{v}'"
-        ))),
+        None | Some("") => Ok(None),
+        Some(v) => SecurityModeArg::parse(v)
+            .map(Some)
+            .ok_or_else(|| ScanError::InvalidArgument(format!("invalid security_mode '{v}'"))),
     }
 }
 

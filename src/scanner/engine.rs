@@ -251,7 +251,9 @@ impl Worker {
                     .filters
                     .attributes_match(&node_id, &attr, &self.namespaces)
             {
-                let record = self.build_record(&reference, &node_id, &path, &attr).await;
+                let record = self
+                    .build_record(&reference, &node_id, &path, &attr, &pending.node_id)
+                    .await;
                 if crate::filters::is_subscribable(&attr) {
                     self.stats.inc_subscribable();
                 }
@@ -283,6 +285,7 @@ impl Worker {
         node_id: &NodeId,
         path: &str,
         attr: &crate::opcua::attributes::NodeAttributes,
+        parent: &NodeId,
     ) -> NodeRecord {
         let datatype = attr.data_type.as_ref().map(|dt| {
             crate::filters::predicate::builtin_datatype_name(dt)
@@ -307,6 +310,8 @@ impl Worker {
             current_value: None,
             engineering_units: None,
             description: attr.description.clone(),
+            parent_node_id: (reference.node_class == opcua::types::NodeClass::Method)
+                .then(|| parent.to_string()),
         };
 
         if self.config.preview_values && record.subscribable {

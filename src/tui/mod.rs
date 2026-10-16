@@ -60,10 +60,18 @@ enum JobMsg {
         result: std::result::Result<usize, String>,
         path: PathBuf,
     },
-    /// A background collection of variable nodes (for an acquire config)
-    /// finished.
+    /// A background collection of the Variables below the marked subtrees
+    /// (for an acquire config or a point library) finished; each record comes
+    /// with the mode of the mark it was found under.
     CollectDone {
-        result: std::result::Result<Vec<crate::acquire::generate::GenNode>, String>,
+        result: std::result::Result<Vec<(NodeRecord, Option<GenMode>)>, String>,
+    },
+    /// Datatypes and method arguments of the records to write as a point
+    /// library were discovered.
+    LibraryReady {
+        records: Vec<NodeRecord>,
+        schema: crate::tedge_dot::schema::Schema,
+        remove: std::collections::HashSet<String>,
     },
 }
 
@@ -115,6 +123,21 @@ pub struct TuiOptions {
     /// When set, the `a` action edits this existing config in place (updating
     /// only the selection) instead of generating a fresh file with a prompt.
     pub source_config: Option<PathBuf>,
+    /// The tedge-dot point library written by the `t` action (merged into
+    /// when it exists; its points are part of `selected_ids`).
+    pub library_file: PathBuf,
+    /// Settings for a new point library.
+    pub library_options: crate::tedge_dot::library::LibraryOptions,
+}
+
+/// What a background Variable collection is for.
+enum CollectFor {
+    /// An acquire config with this default mode and interval.
+    Acquire(GenMode, Duration),
+    /// The point library; points of these (server) node ids are removed.
+    Library {
+        remove: std::collections::HashSet<String>,
+    },
 }
 
 /// Run the interactive explorer until the user quits.
@@ -166,6 +189,10 @@ pub async fn run(
                 Some(m) => {
                     if app.handle_job_msg(m) {
                         job_rx = None;
+                    }
+                    // A finished job may have started the next one.
+                    if let Some(rx) = app.pending_job.take() {
+                        job_rx = Some(rx);
                     }
                 }
                 None => {
@@ -265,8 +292,8 @@ struct App {
     acquire_mode: bool,
     /// Current text of the acquire-config prompt.
     acquire_query: String,
-    /// Chosen mode + interval awaiting a background node collection to finish.
-    acquire_pending: Option<(crate::acquire::generate::GenMode, Duration)>,
+    /// What the running background node collection is for.
+    collect_pending: Option<CollectFor>,
     /// When true, hide nodes that don't lead to Variables (declutter view).
     vars_only: bool,
     /// In-progress background job state (for the progress bar), if any.
@@ -296,7 +323,7 @@ impl App {
                 options.selected_ids.len()
             )
         } else {
-            "↑/↓ move · →/← expand · space mark · S sub · P poll · V vars-only · v value · s validate · e export · a acquire · / filter · q quit".into()
+            "↑/↓ move · →/← expand · space mark · S sub · P poll · V vars-only · v value · s validate · e export · a acquire · t library · / filter · q quit".into()
         };
         Self {
             session,
@@ -313,7 +340,7 @@ impl App {
             filter_mode: false,
             acquire_mode: false,
             acquire_query: String::new(),
-            acquire_pending: None,
+            collect_pending: None,
             vars_only: false,
             job: None,
             job_cancel: None,
@@ -637,6 +664,7 @@ impl App {
                             .into();
                 }
             }
+            KeyCode::Char('t') => self.start_library(),
             KeyCode::Char('x') => self.cancel_job(),
             KeyCode::Char('/') => {
                 self.filter_mode = true;
@@ -774,22 +802,44 @@ impl App {
                 self.job_cancel = None;
                 true
             }
+            JobMsg::LibraryReady {
+                records,
+                schema,
+                remove,
+            } => {
+                self.job = None;
+                self.job_cancel = None;
+                self.write_library(&records, &remove, &schema);
+                true
+            }
             JobMsg::CollectDone { result } => {
                 self.job = None;
                 self.job_cancel = None;
-                let pending = self.acquire_pending.take();
+                let pending = self.collect_pending.take();
                 match (result, pending) {
-                    (Ok(nodes), Some((mode, interval))) => {
+                    (Ok(records), Some(CollectFor::Acquire(mode, interval))) => {
+                        let nodes: Vec<_> = records
+                            .iter()
+                            .filter(|(r, _)| {
+                                r.node_class == "Variable" && !record_is_unreadable_variable(r)
+                            })
+                            .map(|(r, m)| record_to_gennode(r, *m))
+                            .collect();
                         if nodes.is_empty() {
                             self.status = "no variables found in the marked selection".into();
                         } else {
                             self.write_acquire_config(nodes, mode, interval);
                         }
                     }
-                    (Ok(_), None) => {
-                        self.status = "acquire: internal error (no pending mode)".into();
+                    (Ok(records), Some(CollectFor::Library { remove })) => {
+                        let records: Vec<NodeRecord> =
+                            records.into_iter().map(|(r, _)| r).collect();
+                        self.start_discovery(records, remove);
                     }
-                    (Err(e), _) => self.status = format!("acquire collect failed: {e}"),
+                    (Ok(_), None) => {
+                        self.status = "collect: internal error (nothing pending)".into();
+                    }
+                    (Err(e), _) => self.status = format!("collect failed: {e}"),
                 }
                 true
             }
@@ -1107,15 +1157,7 @@ impl App {
             }
         };
 
-        // Top-level marked subtrees (a mark covers the whole subtree).
-        let marked_roots: Vec<usize> = self
-            .arena
-            .iter()
-            .enumerate()
-            .filter(|(i, n)| n.marked && n.parent.is_some() && !self.ancestor_marked(*i))
-            .map(|(i, _)| i)
-            .collect();
-
+        let marked_roots = self.marked_roots();
         if marked_roots.is_empty() {
             // Nothing marked: use the Variables already loaded in memory.
             let candidates: Vec<&Node> = self
@@ -1144,7 +1186,22 @@ impl App {
             return;
         }
 
-        // Traverse each marked subtree in the background to collect Variables.
+        self.start_collect(&marked_roots, CollectFor::Acquire(mode, interval));
+    }
+
+    /// Top-level marked subtrees (a mark covers the whole subtree).
+    fn marked_roots(&self) -> Vec<usize> {
+        self.arena
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| n.marked && n.parent.is_some() && !self.ancestor_marked(*i))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Traverse each marked subtree in the background to collect Variables;
+    /// `pending` says what to do with them when the job reports back.
+    fn start_collect(&mut self, marked_roots: &[usize], pending: CollectFor) {
         let roots: Vec<ExportRoot> = marked_roots
             .iter()
             .map(|&idx| ExportRoot {
@@ -1169,7 +1226,7 @@ impl App {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = mpsc::channel(16);
 
-        self.acquire_pending = Some((mode, interval));
+        self.collect_pending = Some(pending);
         self.job = Some(JobState {
             verb: format!("Collecting variables from {} subtree(s)", roots.len()),
             processed: 0,
@@ -1182,6 +1239,118 @@ impl App {
         tokio::spawn(async move {
             collect_job(session, filters, namespaces, roots, tmpl, cancel, tx).await;
         });
+    }
+
+    /// Write the marked nodes as a tedge-dot point library (`t`). Marked
+    /// subtrees are traversed in the background; with nothing marked, the
+    /// already-loaded Variables are used immediately.
+    fn start_library(&mut self) {
+        if self.job.is_some() {
+            self.status = "busy — please wait for the current operation".into();
+            return;
+        }
+        let marked_roots = self.marked_roots();
+        if marked_roots.is_empty() {
+            let records: Vec<NodeRecord> = self
+                .arena
+                .iter()
+                .filter(|n| n.parent.is_some() && is_point_class(n.class))
+                .map(|n| self.node_to_record(n))
+                .collect();
+            if records.is_empty() {
+                self.status =
+                    "no variables or methods marked or loaded — mark nodes with space, then press t"
+                        .into();
+                return;
+            }
+            self.start_discovery(records, Default::default());
+            return;
+        }
+        // A library point is removed when its node is shown in the tree and
+        // left unmarked; nodes never loaded keep their points.
+        let remove = self
+            .arena
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| {
+                n.parent.is_some()
+                    && is_point_class(n.class)
+                    && !n.marked
+                    && !self.ancestor_marked(*i)
+            })
+            .map(|(_, n)| n.node_id.to_string())
+            .collect();
+        self.start_collect(&marked_roots, CollectFor::Library { remove });
+    }
+
+    /// Discover the custom datatypes and method arguments of `records` in the
+    /// background; the library is written when the job reports back.
+    fn start_discovery(
+        &mut self,
+        records: Vec<NodeRecord>,
+        remove: std::collections::HashSet<String>,
+    ) {
+        let session = self.session.clone();
+        let (tx, rx) = mpsc::channel(1);
+        self.job = Some(JobState {
+            verb: "Reading datatypes and method arguments".into(),
+            processed: 0,
+            counted: false,
+        });
+        self.pending_job = Some(rx);
+        self.status = "reading datatypes and method arguments…".into();
+        tokio::spawn(async move {
+            let schema = crate::tedge_dot::schema::discover(&session, &records).await;
+            let _ = tx
+                .send(JobMsg::LibraryReady {
+                    records,
+                    schema,
+                    remove,
+                })
+                .await;
+        });
+    }
+
+    /// Write (or merge into) the point library and report the counts.
+    fn write_library(
+        &mut self,
+        records: &[NodeRecord],
+        remove: &std::collections::HashSet<String>,
+        schema: &crate::tedge_dot::schema::Schema,
+    ) {
+        let path = self.options.library_file.clone();
+        let existing = if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(e) => {
+                    self.status = format!("library read failed: {e}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.status = match crate::tedge_dot::library::write(
+            existing.as_deref(),
+            records,
+            remove,
+            &self.namespaces,
+            &self.options.library_options,
+            schema,
+        ) {
+            Ok(outcome) => match std::fs::write(&path, &outcome.text) {
+                Ok(()) => format!(
+                    "library {}: +{} −{} point(s), {} in total, {} node(s) skipped",
+                    path.display(),
+                    outcome.added,
+                    outcome.removed,
+                    outcome.total,
+                    outcome.skipped.len()
+                ),
+                Err(e) => format!("library write failed: {e}"),
+            },
+            Err(e) => format!("library {}: {e}", path.display()),
+        };
     }
 
     /// Generate and write the acquire config to the configured path.
@@ -1262,6 +1431,10 @@ impl App {
             current_value: node.value.clone(),
             engineering_units: None,
             description: attrs.description.clone(),
+            parent_node_id: node
+                .parent
+                .filter(|_| node.class == NodeClass::Method)
+                .map(|p| self.arena[p].node_id.to_string()),
         }
     }
 
@@ -1670,18 +1843,7 @@ async fn collect_job(
     use std::collections::HashSet;
     use std::sync::atomic::Ordering;
 
-    // Build a GenNode from a discovered record, capturing the namespace URI.
-    fn to_gennode(record: &NodeRecord, mode: Option<GenMode>) -> crate::acquire::generate::GenNode {
-        crate::acquire::generate::GenNode {
-            id: record.node_id.clone(),
-            namespace: Some(record.namespace_uri.clone()).filter(|s| !s.is_empty()),
-            name: Some(record.display_name.clone()).filter(|s| !s.is_empty()),
-            path: Some(record.browse_path.clone()).filter(|s| !s.is_empty()),
-            mode,
-        }
-    }
-
-    let mut nodes: Vec<crate::acquire::generate::GenNode> = Vec::new();
+    let mut nodes: Vec<(NodeRecord, Option<GenMode>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut processed = 0usize;
 
@@ -1691,12 +1853,9 @@ async fn collect_job(
         }
 
         let root_mode = gen_mode_of(root.mode);
-        // Include the marked node itself if it is a Variable.
-        if root.record.node_class == "Variable"
-            && !record_is_unreadable_variable(&root.record)
-            && seen.insert(root.record.node_id.clone())
-        {
-            nodes.push(to_gennode(&root.record, root_mode));
+        // Include the marked node itself if it is a Variable or Method.
+        if is_point_record(&root.record) && seen.insert(root.record.node_id.clone()) {
+            nodes.push((root.record.clone(), root_mode));
         }
 
         let config = Arc::new(crate::scanner::ScanConfig {
@@ -1720,13 +1879,14 @@ async fn collect_job(
         let (rtx, mut rrx) = mpsc::channel::<NodeRecord>(1024);
         let handle = tokio::spawn(async move { engine.run(rtx).await });
 
-        while let Some(record) = rrx.recv().await {
+        while let Some(mut record) = rrx.recv().await {
             processed += 1;
-            if record.node_class == "Variable"
-                && !record_is_unreadable_variable(&record)
-                && seen.insert(record.node_id.clone())
-            {
-                nodes.push(to_gennode(&record, root_mode));
+            // Engine paths are relative to its root; restore the absolute path.
+            if !root.path.is_empty() {
+                record.browse_path = format!("{}/{}", root.path, record.browse_path);
+            }
+            if is_point_record(&record) && seen.insert(record.node_id.clone()) {
+                nodes.push((record, root_mode));
             }
             if processed % 64 == 0 {
                 let _ = tx.send(JobMsg::Progress { processed }).await;
@@ -1736,6 +1896,29 @@ async fn collect_job(
     }
 
     let _ = tx.send(JobMsg::CollectDone { result: Ok(nodes) }).await;
+}
+
+/// Node classes that can become tedge-dot points.
+fn is_point_class(class: NodeClass) -> bool {
+    matches!(class, NodeClass::Variable | NodeClass::Method)
+}
+
+fn is_point_record(record: &NodeRecord) -> bool {
+    matches!(record.node_class.as_str(), "Variable" | "Method")
+}
+
+/// Build a GenNode from a discovered record, capturing the namespace URI.
+fn record_to_gennode(
+    record: &NodeRecord,
+    mode: Option<GenMode>,
+) -> crate::acquire::generate::GenNode {
+    crate::acquire::generate::GenNode {
+        id: record.node_id.clone(),
+        namespace: Some(record.namespace_uri.clone()).filter(|s| !s.is_empty()),
+        name: Some(record.display_name.clone()).filter(|s| !s.is_empty()),
+        path: Some(record.browse_path.clone()).filter(|s| !s.is_empty()),
+        mode,
+    }
 }
 
 /// Map a per-node [`NodeMode`] to a [`GenMode`] for config generation; `Auto`
