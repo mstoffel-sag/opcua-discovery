@@ -182,6 +182,41 @@ query, returning the top `--limit` results (default `50`). **[Confirmed]** (`src
 partition nodes into poll vs subscribe by **effective mode**, and run scan/poll/subscribe/history
 tasks concurrently, emitting samples to a `Sink`. **[Confirmed]** (`src/acquire/mod.rs`, `src/cli/acquire.rs`).
 
+#### Requirement: Preferred configs SHALL use one device with addressable points
+One file SHALL contain exactly one `[[device]]`; multiple devices SHALL use separate files
+via `--config-dir`. The optional device `name` identifies the source. Connection/security
+fields such as `trust_server` SHALL live directly on the device; `protocol_address` SHALL
+contain `endpoint` and a full ordered `namespaces` URI array. Each `[[device.point]]` SHALL
+have a unique logical `id` and `address.node_id`, with optional `name`, `mode`, and cached
+`path`. The logical id SHALL NOT become an output name: explicit names and prior fallbacks
+and path-based keys retain their meanings.
+
+Legacy `[connection]`, `[selection].node_ids`, and `[[selection.node]]` parsing SHALL remain
+supported. Top-level `[[task]]`, `[output]`, `[acquire]`, and `[selection]` discovery filters
+SHALL retain their semantics. Preferred and legacy explicit-connection/selection forms
+SHALL NOT be mixed.
+
+##### Scenario: A server reorders namespaces before a run
+- **WHEN** `address.node_id` uses `ns=4` and the configured URI at array slot 4 appears at live
+  index 7
+- **THEN** the point SHALL resolve using index 7, not index 4.
+- **AND** missing config slots or live URIs SHALL fail safely, without numeric fallback.
+- Namespace 0 SHALL be `http://opcfoundation.org/UA/`; unused preceding slots SHALL not be
+  removed from a shared array. Arrays SHALL NOT be sorted, compacted, or deduplicated.
+- Without a `namespaces` table, preferred and legacy addresses SHALL retain literal
+  indexes (legacy per-node URI mappings still apply). Implicit and explicit namespace 0
+  SHALL remain fixed to the standard OPC UA URI.
+
+Acquisition and `browse --tui` / `browse --config` SHALL read the active session's
+NamespaceTable, bypassing disk namespace caches for remapping and config generation.
+Other browse cache behavior SHALL remain unchanged.
+
+This is a limited tedge-dot-style config surface, not full tedge-dot compatibility or an
+engine/MQTT replacement. Modes and cached paths are tool-specific extensions, with no new
+security guarantees. Acquisition loads namespaces and resolves points once; underlying
+client session retries do not refresh/remap them after reconnect. Restart after namespace
+table changes during a run.
+
 ##### Scenario: Per-node mode routing
 - **WHEN** a node has an explicit `mode` (`subscribe`/`poll`)
 - **THEN** that mode wins; otherwise `auto` subscribes iff the node is subscribable and the server
@@ -197,7 +232,8 @@ tasks concurrently, emitting samples to a `Sink`. **[Confirmed]** (`src/acquire/
 - **THEN** each reading is emitted as a thin-edge.io measurement object `{ "time": ..., "<key>": <value>, "meta": {...} }`. **[Confirmed]** (test `acquire_poll_emits_tedge_measurements`, `src/acquire/sink.rs`).
 
 #### Requirement: The system SHALL cache reconstructed browse paths back into the config
-On first run, missing `path` values for explicit `[[selection.node]]` entries SHALL be reconstructed
+On first run, missing `path` values for explicit `[[device.point]]` or legacy
+`[[selection.node]]` entries SHALL be reconstructed
 and written back to the config file (preserving formatting via `toml_edit`). **[Confirmed]** (`persist_node_paths`, `update_node_paths_in_toml`).
 
 ### 4.6 Capability: Interactive TUI
@@ -250,7 +286,7 @@ The canonical record types. Full field lists are in the component docs.
 | `Sample` | `src/acquire/sink.rs` | An emitted reading (name, node_id, value, time, status, shared `meta`). **[Confirmed]** |
 | `SampleMeta` | `src/acquire/sink.rs` | Descriptive metadata (data_type, units, browse/display name, path, namespace, eu_range, source). **[Confirmed]** |
 | `ValueReading` / `ValueSnapshot` | `src/opcua/value.rs` | Read value with/without timestamps + status. **[Confirmed]** |
-| `AcquireConfig` (+ sub-tables) | `src/acquire/config.rs` | The acquire TOML schema (connection, acquire, selection, output, tasks). **[Confirmed]** |
+| `AcquireConfig` (+ sub-tables) | `src/acquire/config.rs` | The acquire TOML schema (device/point, legacy connection/selection, acquire, discovery filters, output, tasks). |
 | `Profile` | `src/config/mod.rs` | YAML saved defaults for a server. **[Confirmed]** |
 | `ScanStats` / `StatsSnapshot` | `src/scanner/stats.rs` | Traversal counters. **[Confirmed]** |
 

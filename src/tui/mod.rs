@@ -108,6 +108,8 @@ pub struct TuiOptions {
     /// Node ids pre-selected from a loaded `acquire` config; these are marked in
     /// the tree as they are encountered while browsing.
     pub selected_ids: std::collections::HashSet<String>,
+    /// Saved per-node modes keyed by the remapped live node id.
+    pub selected_modes: std::collections::HashMap<String, NodeMode>,
     /// Browse paths (relative to the root) of the pre-selected nodes, used to
     /// auto-expand the tree to those nodes on startup so they are revealed and
     /// marked without the user having to hunt for them.
@@ -332,6 +334,12 @@ impl App {
             .await
             .unwrap_or_else(|| "Root".into());
         let marked = self.options.selected_ids.contains(&root_id.to_string());
+        let mode = self
+            .options
+            .selected_modes
+            .get(&root_id.to_string())
+            .copied()
+            .unwrap_or(NodeMode::Auto);
         let root = Node {
             node_id: root_id,
             label,
@@ -345,7 +353,7 @@ impl App {
             expandable: true,
             loading: false,
             marked,
-            mode: NodeMode::Auto,
+            mode,
             attrs: None,
             value: None,
         };
@@ -411,6 +419,12 @@ impl App {
             if marked {
                 newly_located += 1;
             }
+            let mode = self
+                .options
+                .selected_modes
+                .get(&child.node_id.to_string())
+                .copied()
+                .unwrap_or(NodeMode::Auto);
             let node = Node {
                 node_id: child.node_id,
                 label: child.label,
@@ -424,7 +438,7 @@ impl App {
                 expandable: child.expandable,
                 loading: false,
                 marked,
-                mode: NodeMode::Auto,
+                mode,
                 attrs: child.attrs,
                 value: None,
             };
@@ -1049,7 +1063,6 @@ impl App {
                 mode: self.arena[idx].mode,
             })
             .collect();
-
         let session = self.session.clone();
         let filters = self.filters.clone();
         let namespaces = self.namespaces.clone();
@@ -1154,6 +1167,12 @@ impl App {
                 mode: self.arena[idx].mode,
             })
             .collect();
+        let node_modes = collection_node_modes(
+            &self.options.selected_modes,
+            self.arena
+                .iter()
+                .map(|node| (node.node_id.to_string(), node.marked, node.mode)),
+        );
 
         let session = self.session.clone();
         let filters = self.filters.clone();
@@ -1180,7 +1199,16 @@ impl App {
         self.status = "collecting variables in background… (x to cancel)".into();
 
         tokio::spawn(async move {
-            collect_job(session, filters, namespaces, roots, tmpl, cancel, tx).await;
+            collect_job(
+                session,
+                filters,
+                namespaces,
+                CollectSelection { roots, node_modes },
+                tmpl,
+                cancel,
+                tx,
+            )
+            .await;
         });
     }
 
@@ -1199,7 +1227,11 @@ impl App {
         if let Some(src) = self.options.source_config.clone() {
             match std::fs::read_to_string(&src) {
                 Ok(original) => {
-                    match crate::acquire::generate::update_selection_in_toml(&original, &nodes) {
+                    match crate::acquire::generate::update_selection_in_toml(
+                        &original,
+                        &nodes,
+                        &self.namespaces,
+                    ) {
                         Ok(updated) => match std::fs::write(&path, updated) {
                             Ok(()) => {
                                 self.status =
@@ -1220,6 +1252,7 @@ impl App {
             nodes,
             mode,
             interval,
+            &self.namespaces,
         ) {
             Ok(toml) => match std::fs::write(&path, toml) {
                 Ok(()) => {
@@ -1566,6 +1599,11 @@ struct ExportRoot {
     mode: NodeMode,
 }
 
+struct CollectSelection {
+    roots: Vec<ExportRoot>,
+    node_modes: std::collections::HashMap<String, NodeMode>,
+}
+
 /// Traversal settings reused by the background export's concurrent engine.
 struct ExportTemplate {
     strategy: crate::cli::Strategy,
@@ -1662,7 +1700,7 @@ async fn collect_job(
     session: Arc<Session>,
     filters: Arc<FilterSet>,
     namespaces: Arc<NamespaceTable>,
-    roots: Vec<ExportRoot>,
+    selection: CollectSelection,
     tmpl: ExportTemplate,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     tx: mpsc::Sender<JobMsg>,
@@ -1685,18 +1723,18 @@ async fn collect_job(
     let mut seen: HashSet<String> = HashSet::new();
     let mut processed = 0usize;
 
-    for root in roots {
+    for root in selection.roots {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
 
-        let root_mode = gen_mode_of(root.mode);
         // Include the marked node itself if it is a Variable.
         if root.record.node_class == "Variable"
             && !record_is_unreadable_variable(&root.record)
             && seen.insert(root.record.node_id.clone())
         {
-            nodes.push(to_gennode(&root.record, root_mode));
+            let mode = collected_node_mode(&root.record.node_id, root.mode, &selection.node_modes);
+            nodes.push(to_gennode(&root.record, mode));
         }
 
         let config = Arc::new(crate::scanner::ScanConfig {
@@ -1726,7 +1764,8 @@ async fn collect_job(
                 && !record_is_unreadable_variable(&record)
                 && seen.insert(record.node_id.clone())
             {
-                nodes.push(to_gennode(&record, root_mode));
+                let mode = collected_node_mode(&record.node_id, root.mode, &selection.node_modes);
+                nodes.push(to_gennode(&record, mode));
             }
             if processed % 64 == 0 {
                 let _ = tx.send(JobMsg::Progress { processed }).await;
@@ -1736,6 +1775,30 @@ async fn collect_job(
     }
 
     let _ = tx.send(JobMsg::CollectDone { result: Ok(nodes) }).await;
+}
+
+fn collection_node_modes(
+    saved: &std::collections::HashMap<String, NodeMode>,
+    loaded: impl IntoIterator<Item = (String, bool, NodeMode)>,
+) -> std::collections::HashMap<String, NodeMode> {
+    // Loaded marks win, including Auto; saved modes cover lazily unloaded nodes.
+    let mut modes = saved.clone();
+    for (id, marked, mode) in loaded {
+        if marked {
+            modes.insert(id, mode);
+        } else {
+            modes.remove(&id);
+        }
+    }
+    modes
+}
+
+fn collected_node_mode(
+    id: &str,
+    inherited: NodeMode,
+    modes: &std::collections::HashMap<String, NodeMode>,
+) -> Option<GenMode> {
+    gen_mode_of(modes.get(id).copied().unwrap_or(inherited))
 }
 
 /// Map a per-node [`NodeMode`] to a [`GenMode`] for config generation; `Auto`
@@ -1848,5 +1911,68 @@ fn encoding_for(path: &std::path::Path) -> crate::cli::Encoding {
         Some("csv") => crate::cli::Encoding::Csv,
         Some("ndjson") => crate::cli::Encoding::Ndjson,
         _ => crate::cli::Encoding::Json,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn subtree_collection_keeps_marked_descendant_mode() {
+        let saved = HashMap::from([
+            ("ns=2;s=Parent".into(), NodeMode::Subscribe),
+            ("ns=2;s=Child".into(), NodeMode::Poll),
+        ]);
+        let modes = collection_node_modes(
+            &saved,
+            [
+                ("ns=2;s=Parent".into(), true, NodeMode::Subscribe),
+                ("ns=2;s=Child".into(), true, NodeMode::Poll),
+            ],
+        );
+        assert_eq!(
+            collected_node_mode("ns=2;s=Child", NodeMode::Subscribe, &modes),
+            Some(GenMode::Poll)
+        );
+        assert_eq!(
+            collected_node_mode("ns=2;s=NewChild", NodeMode::Subscribe, &modes),
+            Some(GenMode::Subscribe)
+        );
+    }
+
+    #[test]
+    fn subtree_collection_keeps_unloaded_modes_and_explicit_auto_changes() {
+        let saved = HashMap::from([
+            ("ns=2;s=Unloaded".into(), NodeMode::Poll),
+            ("ns=2;s=Auto".into(), NodeMode::Poll),
+            ("ns=2;s=Unmarked".into(), NodeMode::Poll),
+            ("ns=2;s=Changed".into(), NodeMode::Subscribe),
+        ]);
+        let modes = collection_node_modes(
+            &saved,
+            [
+                ("ns=2;s=Auto".into(), true, NodeMode::Auto),
+                ("ns=2;s=Unmarked".into(), false, NodeMode::Auto),
+                ("ns=2;s=Changed".into(), true, NodeMode::Poll),
+            ],
+        );
+        assert_eq!(
+            collected_node_mode("ns=2;s=Unloaded", NodeMode::Subscribe, &modes),
+            Some(GenMode::Poll)
+        );
+        assert_eq!(
+            collected_node_mode("ns=2;s=Auto", NodeMode::Subscribe, &modes),
+            None
+        );
+        assert_eq!(
+            collected_node_mode("ns=2;s=Unmarked", NodeMode::Subscribe, &modes),
+            Some(GenMode::Subscribe)
+        );
+        assert_eq!(
+            collected_node_mode("ns=2;s=Changed", NodeMode::Subscribe, &modes),
+            Some(GenMode::Poll)
+        );
     }
 }

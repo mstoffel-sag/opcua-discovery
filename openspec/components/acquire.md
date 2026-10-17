@@ -12,10 +12,51 @@ subscribe by **effective mode**, and runs scan/poll/subscribe/history tasks conc
 
 ## Config schema (`config.rs`) — `AcquireConfig` (`#[serde(deny_unknown_fields)]`)
 
-Tables: `[connection]`, `[acquire]`, `[selection]`, `[output]`, and one or more `[[task]]`
-(`#[serde(rename = "task")]`, **≥1 required**).
+Preferred tables: exactly one `[[device]]`, zero or more `[[device.point]]`, optional
+`[acquire]`, `[selection]` (discovery filters), `[output]`, and one or more `[[task]]`
+(**≥1 required**). Use `acquire --config-dir DIR` for multiple device files, not multiple
+devices in one file. Legacy connection and explicit-selection tables remain readable.
 
-### `[connection]` — `ConnectionConfig`
+### `[[device]]` — preferred connection/source
+- Optional `name` becomes `meta.source.name`.
+- `protocol_address = { endpoint = "...", namespaces = ["http://opcfoundation.org/UA/", ...] }`.
+  `namespaces` is the full ordered config-local URI table, not a compact list of selected URIs.
+- Connection/security options live **directly on the device**: `user`, `password` (`env:VAR`),
+  `cert`, `key`, `security_policy`, `security_mode`, `trust_server`, `pki_dir`, `timeout`,
+  `retry`, `cache`. Do not nest these in `protocol_address` or a device security table.
+- `trust_server` remains opt-in and insecure; this schema adds no security guarantees.
+
+### `[[device.point]]` — preferred explicit selection
+- `id`: required unique logical config key (for example `boiler-output`), **not** an OPC UA
+  NodeId and **not** an output measurement name.
+- `address = { node_id = "ns=4;i=1244" }`: OPC UA address with a config-local namespace index.
+  `address.namespace` is unsupported; preferred namespace URIs belong only in
+  `protocol_address.namespaces`. Legacy `[[selection.node]].namespace` remains supported.
+- Optional `name`, `mode` (`auto` / `subscribe` / `poll`), and cached `path` retain the
+  legacy meanings. Omitted `name` retains the previous browse-name/NodeId fallback;
+  logical ids must not leak into output names. Existing path-based output keys are unchanged.
+
+#### Namespace safety
+Before use, a point's configured numeric namespace index selects a URI from the device's
+shared array; that URI is looked up in the live server table and the NodeId is remapped
+to the live index. With an array supplied, an absent config slot or absent live URI
+fails safely: never reuse the configured numeric index as a fallback. Without a
+`namespaces` table, both preferred and legacy addresses retain literal indexes;
+legacy per-node `namespace` URI mappings still apply when supplied. Implicit namespace
+0 (`i=...`) and explicit `ns=0` are fixed to `http://opcfoundation.org/UA/`;
+array slot 0 must have that URI. Include all preceding slots, even unused ones.
+Never sort, compact, or deduplicate an array. An ns0-only file may use just
+`["http://opcfoundation.org/UA/"]`.
+
+Acquisition always reads the active session's NamespaceTable, bypassing the disk
+namespace cache. `browse --tui` and `browse --config` do the same for safe preselection,
+remapping, and config generation; other browse cache behavior is unchanged.
+
+The fixture `test.toml` uses the full nine-entry table recorded for its endpoint in
+`tmp/opc_tcp___opcua_demo_this_com_51210_UA_SampleServer.namespaces.json`; its namespace
+4/5 selections retain the Boiler and Boiler/Instance URIs at those slots.
+
+### `[connection]` — legacy `ConnectionConfig`
 `endpoint`, `name` (→ `meta.source.name`), `user`, `password` (`env:VAR`), `cert`, `key`,
 `security_policy`, `security_mode`, `trust_server` (def false), `pki_dir`, `timeout` (humantime),
 `retry`, `cache`. Methods `to_args()`, `apply_to(&mut ConnectionArgs)` (CLI precedence).
@@ -25,7 +66,7 @@ Tables: `[connection]`, `[acquire]`, `[selection]`, `[output]`, and one or more 
 - `poll_only: bool` (def false) — force all nodes to poll.
 - **`NodeMode`** (`lowercase`): `auto` (default) | `subscribe` | `poll`.
 
-### `[selection]` — `SelectionConfig`
+### `[selection]` — discovery filters and legacy explicit selection
 - `node_ids: Vec<String>` — legacy bare ids (index not remapped).
 - `nodes: Vec<NodeSelector>` (`#[serde(rename = "node")]`) — rich entries.
 - `root: Option<String>` (def `i=85`), `depth: Option<String>` (number/`unlimited`, def 3).
@@ -33,10 +74,19 @@ Tables: `[connection]`, `[acquire]`, `[selection]`, `[output]`, and one or more 
   `datatype`.
 - Methods: `depth() -> Depth`, `to_filter_args() -> FilterArgs`.
 
-#### `[[selection.node]]` — `NodeSelector`
+#### `[[selection.node]]` — legacy `NodeSelector`
 `id` (e.g. `ns=4;i=1274`), `namespace` (URI; remaps `id`'s index to the server's current index for
 that URI), `name` (measurement name), `path` (cached browse path; reconstructed + cached on first run
 if absent), `mode: NodeMode` (def `auto`).
+
+Keep legacy `id` semantics: it is the OPC UA NodeId, unlike the new point's logical
+`id`. Do not mix preferred device syntax with legacy connection/explicit selections.
+Discovery filters in `[selection]` remain top-level and work with either schema;
+`[acquire]`, `[output]`, and `[[task]]` semantics are unchanged.
+
+The device/point shape is a limited tedge-dot-style configuration surface, not full
+tedge-dot compatibility. Per-point modes and cached paths are tool-specific extensions.
+It neither replaces the acquisition engine/sinks nor adds an MQTT client.
 
 ### `[output]` — `OutputConfig`
 - `format: OutputFormat` (`lowercase`): `tedge` (default) | `json` | `ndjson` | `csv`.
@@ -64,7 +114,7 @@ if absent), `mode: NodeMode` (def `auto`).
 ## Orchestration (`mod.rs`)
 `run(config, duration: Option<Duration>, config_path: Option<&Path>, cancel) -> Result<()>`:
 1. `Connection::connect` (once) → shared `Arc<Session>`.
-2. `load_namespaces` (cache-aware) for URI remapping.
+2. Read the active session's NamespaceTable (bypass disk cache) for URI remapping.
 3. Build `Sink` from `[output]`.
 4. If poll/subscribe/history tasks exist → `selection::resolve` → `Resolved { nodes, path_updates }`;
    optionally `persist_node_paths` (write reconstructed paths back via `toml_edit`).
@@ -78,6 +128,14 @@ if absent), `mode: NodeMode` (def `auto`).
 7. If `duration` set, a timer sets `cancel` to bound continuous tasks.
 8. Await all → `Sink::finish()` → disconnect.
 
+### Reconnection limitation
+`mod.rs` connects once, loads namespaces once, and resolves points once before spawning
+tasks. `opcua/client.rs` starts the underlying session event loop with configured session
+retry limits and an initial retry delay; this is not a runner-level reconnect/remap loop.
+The runner does not reload namespace tables, re-resolve point addresses, or guarantee
+subscription recovery after a reconnect. Restart after server namespace-table changes.
+URI remapping protects initial resolution, not continuous namespace changes during a run.
+
 - `run_poll` — ticker → batch `read_readings(nodes)` → emit `Sample`s.
 - `run_history` — `history::read_raw` per node over the time range → emit `Sample`s.
 - Unit tests cover poll_only override, explicit-mode-wins, auto-follows-default, auto-uses-
@@ -89,7 +147,8 @@ if absent), `mode: NodeMode` (def `auto`).
 - **`SelectedNode`** `{ name, path, node_id, mode, subscribable, meta: SampleMeta }`.
 - **`Resolved`** `{ nodes, path_updates: Vec<(config_id, reconstructed_path)> }`.
 - `resolve(session, config, namespaces, endpoint, cancel)` stages:
-  1. **Explicit** (`resolve_explicit`): parse `id` + optional `namespace` (`remap_node_id`), read
+  1. **Explicit** (`resolve_explicit`): resolve point `address.node_id` through the device URI
+     array (or parse legacy `id` + optional `namespace`), read
      attributes, skip unreadable, resolve path (cached or `reconstruct_browse_path`), build
      `SampleMeta`; dedupe by `NodeId`.
   2. **Filtered** (`resolve_filtered`, if filters present): run `Engine` with `subscribable=true`;
@@ -118,31 +177,34 @@ if absent), `mode: NodeMode` (def `auto`).
 ---
 
 ## Config generation (`generate.rs`) — used by the TUI
-- `GenMode` (`Poll`/`Subscribe`), `GenConnection` (endpoint, trust_server, policy/mode, user [password
-  not written — comment hint], pki_dir), `GenNode` (id, namespace, name, path, mode?).
-- `generate_toml(conn, nodes, default_mode, interval)` — stable sort by `(namespace, id)`; emit poll
-  and/or subscribe task blocks (or one default-mode task if selection empty); emit `[acquire]
-  default_mode` only if any node is auto; prepend a "generated by TUI" header.
-- `update_selection_in_toml(original, nodes)` — preserve formatting (`toml_edit`); drop legacy
-  `node_ids`; replace `[[selection.node]]` entries.
-- `update_node_paths_in_toml(original, updates)` — add/update `path` on matching node entries.
+- New TUI configs emit one `[[device]]`, direct device connection/security fields, the endpoint
+  and full ordered namespace table in `protocol_address`, and `[[device.point]]` entries.
+  Point ids are stable, unique, node-derived logical keys; OPC UA ids go in `address.node_id`.
+- Generation retains optional names, cached paths, and per-point modes, emitting poll and/or
+  subscribe tasks and the existing `[acquire]` policy as appropriate. Passwords are not written.
+- Editing a device config preserves logical ids/names for retained points and maps live namespace
+  indexes back into its config-local URI table. Do not compact/reorder the array without rewriting
+  every affected point address.
+- Legacy files remain supported when loading/editing. Selection updates preserve unrelated
+  task/output/acquire/filter settings; path caching updates the matching point or legacy node.
 
 ---
 
 ## Example (working) config
 ```toml
-[connection]
-endpoint = "opc.tcp://host:4840"
+[[device]]
+name = "Factory"        # optional source name
 trust_server = true
+protocol_address = { endpoint = "opc.tcp://host:4840", namespaces = ["http://opcfoundation.org/UA/", "urn:example:factory"] }
+
+[[device.point]]
+id = "temperature"
+address = { node_id = "ns=1;i=1001" }
+name = "Temperature"
+mode = "subscribe"
 
 [acquire]
 default_mode = "auto"   # auto | subscribe | poll
-
-[selection]
-[[selection.node]]
-id = "ns=3;i=1001"
-name = "Temperature"
-mode = "subscribe"
 
 [output]
 format = "tedge"
@@ -154,6 +216,9 @@ interval = "1s"
 mode = "subscribe"
 publishing_interval = "500ms"
 ```
+
+`trust_server = true` is for lab use only. The namespace array above is a complete
+two-slot example table, not the public demo server's table.
 
 ## Extension points
 - New task type → add a `TaskConfig` variant + a `run_*` task + spawn wiring.

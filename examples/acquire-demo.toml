@@ -1,9 +1,21 @@
 # Example acquisition config for the public OPC UA demo server.
 # Run:  opcua-scan acquire --config examples/acquire-demo.toml --duration 3s
 
-[connection]
-endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer"
+[[device]]
+# Insecure: public demo/lab only. Security options belong directly on the device.
 trust_server = true
+# Only namespace 0 is used; this is the full config-local base array.
+protocol_address = { endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer", namespaces = ["http://opcfoundation.org/UA/"] }
+
+# Server_ServerStatus_CurrentTime updates every second on the demo server.
+[[device.point]]
+id = "ns0-i2258"
+address = { node_id = "i=2258" }
+# name is optional; omitting it preserves the previous output-name fallback.
+
+# Per-point mode overrides the default. Omit `mode` (or set "auto") to follow
+# [acquire].default_mode; use "subscribe" for efficient push updates or "poll"
+# for cyclic reads. These modes and cached paths are tool-specific extensions.
 
 # [acquire] controls how each node is acquired when both poll and subscribe
 # are possible.
@@ -13,18 +25,6 @@ trust_server = true
 #                              # subscriptions entirely
 [acquire]
 default_mode = "auto"
-
-[selection]
-# Server_ServerStatus_CurrentTime updates every second on the demo server.
-node_ids = ["i=2258"]
-
-# Per-node mode overrides the default. Omit `mode` (or set "auto") to follow
-# [acquire].default_mode; use "subscribe" for efficient push updates or "poll"
-# for cyclic reads.
-# [[selection.node]]
-# id = "ns=3;i=1001"
-# name = "Temperature"
-# mode = "subscribe"
 
 [output]
 format = "tedge"
@@ -40,4 +40,3 @@ interval = "1s"
 # mode = "subscribe"
 # publishing_interval = "500ms"
 # sampling_interval = "250ms"
-

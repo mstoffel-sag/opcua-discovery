@@ -36,9 +36,9 @@ pub struct BrowseArgs {
     #[arg(long)]
     pub validate_subscription: bool,
 
-    /// Reuse an existing `acquire` config: its `[connection]` supplies defaults
-    /// and its `selection.node_ids` are pre-marked in the TUI. Saving (the `a`
-    /// action) updates this file in place. CLI flags override config values.
+    /// Reuse an existing `acquire` config: its device or legacy connection
+    /// supplies defaults and its points are pre-marked in the TUI. Saving
+    /// (the `a` action) updates this file in place. CLI flags override config values.
     #[arg(long, value_name = "FILE")]
     pub config: Option<std::path::PathBuf>,
 }
@@ -59,8 +59,12 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
     let conn = Connection::connect(&args.connection).await?;
     let session = conn.session().clone();
 
-    let namespaces =
-        Arc::new(crate::cli::load_namespaces(&session, &args.connection, conn.endpoint()).await?);
+    let namespaces = Arc::new(if acquire_cfg.is_some() || args.output.tui {
+        // Config selection and generation must use this session's namespace indexes.
+        NamespaceTable::read(&session).await?
+    } else {
+        crate::cli::load_namespaces(&session, &args.connection, conn.endpoint()).await?
+    });
     let filters = Arc::new(FilterSet::compile(&args.filters, &namespaces)?);
     let root = resolve_root(&args.traversal.root)?;
 
@@ -69,6 +73,7 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
     // current index so pre-marking matches the live tree even if the server
     // reordered its namespace array.
     let mut selected_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut selected_modes = std::collections::HashMap::new();
     let mut selected_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(cfg) = &acquire_cfg {
         for node in &cfg.selection.nodes {
@@ -77,6 +82,7 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
                 node.namespace.as_deref(),
                 &namespaces,
             )?;
+            selected_modes.insert(id.to_string(), node.mode);
             selected_ids.insert(id.to_string());
             if let Some(path) = &node.path {
                 if !path.is_empty() {
@@ -106,6 +112,7 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
             connection: gen_connection(&args.connection, conn.endpoint()),
             acquire_file,
             selected_ids,
+            selected_modes,
             selected_paths,
             source_config,
         };

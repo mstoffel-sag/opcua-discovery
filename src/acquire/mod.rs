@@ -45,8 +45,8 @@ pub async fn run(
     let conn = Connection::connect(&connection_args).await?;
     let session = conn.session().clone();
 
-    let namespaces =
-        Arc::new(crate::cli::load_namespaces(&session, &connection_args, conn.endpoint()).await?);
+    // Namespace indexes are session-local; a disk cache cannot safely remap selectors.
+    let namespaces = Arc::new(NamespaceTable::read(&session).await?);
     let sink = Arc::new(Sink::new(&config.output)?);
 
     // Resolve concrete nodes once; shared by poll/subscribe/history tasks.

@@ -246,8 +246,23 @@ pub(crate) fn remap_node_id(
 ) -> Result<NodeId> {
     let parsed = NodeId::from_str(id)
         .map_err(|_| ScanError::InvalidArgument(format!("invalid node id '{id}'")))?;
+    if let Some(uri) = ns_uri {
+        if uri.trim().is_empty() {
+            return Err(ScanError::InvalidArgument(format!(
+                "namespace URI for node '{id}' must not be blank"
+            )));
+        }
+        if parsed.namespace == 0 && uri != "http://opcfoundation.org/UA/" {
+            return Err(ScanError::InvalidArgument(format!(
+                "namespace 0 for node '{id}' cannot use namespace URI '{uri}'"
+            )));
+        }
+    }
+    if parsed.namespace == 0 {
+        return Ok(parsed);
+    }
     match ns_uri {
-        Some(uri) if !uri.is_empty() => {
+        Some(uri) => {
             let index = namespaces.index(uri).ok_or_else(|| {
                 ScanError::InvalidArgument(format!(
                     "namespace '{uri}' (for node '{id}') is not present on the server"
@@ -255,7 +270,7 @@ pub(crate) fn remap_node_id(
             })?;
             Ok(NodeId::new(index, parsed.identifier.clone()))
         }
-        _ => Ok(parsed),
+        None => Ok(parsed),
     }
 }
 
@@ -473,4 +488,91 @@ fn measurement_name(record: &NodeRecord) -> String {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| record.node_id.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_namespaces() -> NamespaceTable {
+        NamespaceTable::from_uris(vec![
+            "http://opcfoundation.org/UA/".into(),
+            "urn:server".into(),
+            "urn:plant".into(),
+        ])
+    }
+
+    #[test]
+    fn remapping_preserves_every_identifier_type() {
+        for id in [
+            "ns=4;i=123",
+            "ns=4;s=Machine/Temperature",
+            "ns=4;g=72962b91-fa75-4ae6-8d28-b404dc7daf63",
+            "ns=4;b=AQIDBA==",
+        ] {
+            let original = NodeId::from_str(id).unwrap();
+            let remapped = remap_node_id(id, Some("urn:plant"), &live_namespaces()).unwrap();
+            assert_eq!(remapped.namespace, 2);
+            assert_eq!(remapped.identifier, original.identifier);
+        }
+    }
+
+    #[test]
+    fn missing_uri_fails_with_original_node_context() {
+        let error = remap_node_id("ns=4;i=123", Some("urn:missing"), &live_namespaces())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("urn:missing"), "{error}");
+        assert!(error.contains("ns=4;i=123"), "{error}");
+        assert!(error.contains("not present"), "{error}");
+    }
+
+    #[test]
+    fn namespace_zero_and_legacy_indexes_are_not_remapped() {
+        for id in ["i=123", "ns=0;i=123"] {
+            for uri in [None, Some("http://opcfoundation.org/UA/")] {
+                let node = remap_node_id(id, uri, &NamespaceTable::default()).unwrap();
+                assert_eq!(node, NodeId::from_str(id).unwrap());
+            }
+            assert!(remap_node_id(id, Some("urn:plant"), &live_namespaces()).is_err());
+        }
+        let literal = remap_node_id("ns=4;i=123", None, &live_namespaces()).unwrap();
+        assert_eq!(literal.namespace, 4);
+        for uri in ["", "   "] {
+            assert!(remap_node_id("ns=4;i=123", Some(uri), &live_namespaces()).is_err());
+        }
+    }
+
+    #[test]
+    fn normalized_device_selection_uses_live_namespace_table() {
+        let config = AcquireConfig::from_toml(
+            r#"
+[[device]]
+protocol_address = { endpoint = "opc.tcp://host:4840", namespaces = [
+  "http://opcfoundation.org/UA/", "urn:server", "urn:other", "urn:unused", "urn:plant"
+] }
+[[device.point]]
+id = "stable-key"
+address = { node_id = "ns=4;s=Temperature" }
+[[task]]
+mode = "subscribe"
+"#,
+        )
+        .unwrap();
+        let selector = &config.selection.nodes[0];
+        assert_eq!(selector.id, "ns=4;s=Temperature");
+        let node = remap_node_id(
+            &selector.id,
+            selector.namespace.as_deref(),
+            &live_namespaces(),
+        )
+        .unwrap();
+        assert_eq!(node.to_string(), "ns=2;s=Temperature");
+        assert!(remap_node_id(
+            &selector.id,
+            selector.namespace.as_deref(),
+            &NamespaceTable::default()
+        )
+        .is_err());
+    }
 }

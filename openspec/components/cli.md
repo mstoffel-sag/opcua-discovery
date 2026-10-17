@@ -63,9 +63,20 @@ namespaces, endpoints (+ security) → disconnect.
 
 ### `browse` (`src/cli/browse.rs`) — primary
 `BrowseArgs { connection, traversal, filters, output, validate_subscription, config }`.
-Optionally pre-seed from `--config` (acquire.toml) → connect → load namespaces (cacheable) →
+Optionally pre-seed from `--config` (acquire.toml) → connect → load namespaces →
 compile filters → if `--tui` launch explorer (early return) → else watch-loop: run `Engine`, stream
 `NodeRecord`s, optionally validate subscriptions, render/export; repeat on `--watch`.
+Config loading accepts preferred `[[device]]` / `[[device.point]]` and legacy
+`[connection]` / `[[selection.node]]` / `[selection].node_ids`. Device connection/security
+fields are direct fields; endpoint and ordered namespace URIs are in `protocol_address`.
+Preselection resolves point addresses by URI to live indexes, never by logical point id.
+Top-level `[selection]` discovery filters keep their existing meaning.
+`--tui` or `--config` always reads the active session's NamespaceTable, bypassing
+the disk namespace cache; other browse invocations retain their existing cache behavior.
+Shared URI arrays are ordered config-local indexes: never sort, compact, or deduplicate
+them. When `namespaces` is absent, preferred and legacy addresses keep literal numeric
+indexes (subject to any legacy per-node URI mapping). Implicit/explicit namespace 0
+always denotes the fixed standard OPC UA URI.
 
 ### `search` (`src/cli/search.rs`)
 `SearchArgs { connection, query, traversal, filters, output, limit (50) }`. Require query → scan →
@@ -79,6 +90,22 @@ collect `(path, NodeId)` → `subscription::run_sample` prints live `path = valu
 `AcquireArgs { config, config_dir, duration, poll_only }`. Load one file or a sorted directory of
 configs → apply `--poll-only` override (can only turn on) → `acquire::run(...)` per config. See
 [acquire.md](acquire.md).
+Each preferred config contains **exactly one device**. For multiple devices, place one file
+per device in `--config-dir`; multi-device files are not supported.
+Acquisition always reads the active session's NamespaceTable rather than a potentially
+stale disk namespace cache before resolving addresses.
+
+```sh
+opcua-scan acquire --config examples/acquire-demo.toml --duration 3s
+opcua-scan acquire --config-dir ./devices --poll-only
+opcua-scan browse --config test.toml --tui
+```
+
+`[[task]]`, `[output]`, `[acquire]`, and discovery filters are unchanged. Logical point
+ids are config identity only, not output names. This is not a new engine, an MQTT
+publisher, or full tedge-dot compatibility; poll/subscribe/auto and cached paths remain
+tool-specific. Acquisition resolves namespaces once per run; client session retries do
+not add runner-level namespace refresh/remapping after reconnect.
 
 ## Behavioral notes
 - `main.rs` merges profile, installs signal handler, dispatches, maps errors→exit codes, and exits

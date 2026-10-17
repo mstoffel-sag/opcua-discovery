@@ -5,7 +5,9 @@
 //! the output, and one or more tasks (scan / poll / subscribe / history) that
 //! run concurrently against the same session.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -16,24 +18,165 @@ use crate::cli::{
 use crate::error::{Result, ScanError};
 
 /// A fully parsed acquisition configuration (one TOML file).
+///
+/// Device/point configs are normalized into the same connection and selection
+/// model as legacy configs before any acquisition task is started.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawAcquireConfig")]
 pub struct AcquireConfig {
     /// Connection / security settings.
-    #[serde(default)]
     pub connection: ConnectionConfig,
     /// Acquisition policy (default per-node mode, global poll-only override).
-    #[serde(default)]
     pub acquire: AcquireOptions,
     /// Node selection (explicit ids and/or filters).
-    #[serde(default)]
     pub selection: SelectionConfig,
     /// Output destination and encoding.
-    #[serde(default)]
     pub output: OutputConfig,
     /// One or more acquisition tasks to run concurrently.
-    #[serde(default, rename = "task")]
     pub tasks: Vec<TaskConfig>,
+}
+
+const BASE_NAMESPACE: &str = "http://opcfoundation.org/UA/";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAcquireConfig {
+    connection: Option<ConnectionConfig>,
+    #[serde(default)]
+    acquire: AcquireOptions,
+    selection: Option<toml::Value>,
+    #[serde(default)]
+    output: OutputConfig,
+    #[serde(default, rename = "task")]
+    tasks: Vec<TaskConfig>,
+    device: Option<Vec<toml::Value>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtocolAddress {
+    endpoint: String,
+    namespaces: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PointConfig {
+    id: String,
+    name: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    mode: NodeMode,
+    address: NodeAddress,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeAddress {
+    node_id: String,
+}
+
+impl TryFrom<RawAcquireConfig> for AcquireConfig {
+    type Error = String;
+
+    fn try_from(raw: RawAcquireConfig) -> std::result::Result<Self, String> {
+        let explicit_selection = raw.selection.as_ref().is_some_and(|selection| {
+            selection.get("node").is_some() || selection.get("node_ids").is_some()
+        });
+        let mut selection: SelectionConfig = raw
+            .selection
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let had_connection = raw.connection.is_some();
+        let mut connection = raw.connection.unwrap_or_default();
+        if let Some(mut devices) = raw.device {
+            if devices.len() != 1 {
+                return Err("exactly one [[device]] must be defined when device is present".into());
+            }
+            if had_connection {
+                return Err("[connection] cannot be combined with [[device]]".into());
+            }
+            if explicit_selection {
+                return Err("[selection] node/node_ids cannot be combined with [[device]]".into());
+            }
+            let mut device = devices.remove(0);
+            let table = device.as_table_mut().ok_or("device must be a table")?;
+            let protocol: ProtocolAddress = table
+                .remove("protocol_address")
+                .ok_or("device.protocol_address is required")?
+                .try_into()
+                .map_err(|e| format!("device.protocol_address: {e}"))?;
+            if protocol.endpoint.trim().is_empty() {
+                return Err("device.protocol_address.endpoint must not be blank".into());
+            }
+            if table.contains_key("endpoint") {
+                return Err("device endpoint belongs in protocol_address.endpoint".into());
+            }
+            let points: Vec<PointConfig> = table
+                .remove("point")
+                .map(toml::Value::try_into)
+                .transpose()
+                .map_err(|e| format!("device.point: {e}"))?
+                .unwrap_or_default();
+            connection = device.try_into().map_err(|e| format!("device: {e}"))?;
+            connection.endpoint = Some(protocol.endpoint);
+            if let Some(namespaces) = &protocol.namespaces {
+                if namespaces.first().map(String::as_str) != Some(BASE_NAMESPACE) {
+                    return Err(format!(
+                        "device.protocol_address.namespaces must start with namespace 0 URI '{BASE_NAMESPACE}'"
+                    ));
+                }
+                if namespaces.len() > usize::from(u16::MAX) + 1 {
+                    return Err("device namespace table exceeds the namespace index range".into());
+                }
+                for (index, uri) in namespaces.iter().enumerate() {
+                    if uri.trim().is_empty() {
+                        return Err(format!("namespace URI at index {index} must not be blank"));
+                    }
+                }
+            }
+            let mut point_ids = HashSet::new();
+            for point in points {
+                if point.id.trim().is_empty() || !point_ids.insert(point.id.clone()) {
+                    return Err(format!(
+                        "device point id '{}' must be non-blank and unique",
+                        point.id
+                    ));
+                }
+                let parsed = parse_node_id(&point.address.node_id)?;
+                let namespace = protocol.namespaces.as_ref().map(|table| {
+                    table.get(usize::from(parsed.namespace)).cloned().ok_or_else(|| {
+                        format!(
+                            "point '{}': namespace index {} out of range for device namespace table",
+                            point.id, parsed.namespace
+                        )
+                    })
+                }).transpose()?.filter(|_| parsed.namespace != 0);
+                selection.nodes.push(NodeSelector {
+                    id: point.address.node_id,
+                    namespace,
+                    name: point.name,
+                    path: point.path,
+                    mode: point.mode,
+                });
+            }
+        }
+        let config = Self {
+            connection,
+            acquire: raw.acquire,
+            selection,
+            output: raw.output,
+            tasks: raw.tasks,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn parse_node_id(id: &str) -> std::result::Result<opcua::types::NodeId, String> {
+    opcua::types::NodeId::from_str(id).map_err(|_| format!("invalid node id '{id}'"))
 }
 
 /// How an individual node should be acquired when poll and subscribe tasks
@@ -84,9 +227,7 @@ impl AcquireConfig {
 
     /// Parse a configuration from a TOML string.
     pub fn from_toml(text: &str) -> std::result::Result<Self, String> {
-        let config: AcquireConfig = toml::from_str(text).map_err(|e| e.to_string())?;
-        config.validate()?;
-        Ok(config)
+        toml::from_str(text).map_err(|e| e.to_string())
     }
 
     fn validate(&self) -> std::result::Result<(), String> {
@@ -98,6 +239,7 @@ impl AcquireConfig {
             && self.selection.include.is_empty()
             && self.selection.include_regex.is_empty()
             && self.selection.node_class.is_empty()
+            && self.selection.datatype.is_empty()
             && self.selection.root.is_none()
         {
             // A scan-only run may legitimately use the default root, so only warn
@@ -111,6 +253,26 @@ impl AcquireConfig {
                     "[selection] must specify node_ids or filters for poll/subscribe/history tasks"
                         .to_string(),
                 );
+            }
+        }
+        for id in &self.selection.node_ids {
+            parse_node_id(id)?;
+        }
+        for node in &self.selection.nodes {
+            let parsed = parse_node_id(&node.id)?;
+            if let Some(uri) = &node.namespace {
+                if uri.trim().is_empty() {
+                    return Err(format!(
+                        "namespace URI for node '{}' must not be blank",
+                        node.id
+                    ));
+                }
+                if parsed.namespace == 0 && uri != BASE_NAMESPACE {
+                    return Err(format!(
+                        "namespace 0 for node '{}' must be '{BASE_NAMESPACE}'",
+                        node.id
+                    ));
+                }
             }
         }
         Ok(())
@@ -585,6 +747,215 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const POINT: &str = r#"
+[[device.point]]
+id = "logical-temperature"
+address = { node_id = "ns=4;i=123" }
+"#;
+    const NAMESPACES: &str = r#", namespaces = [
+        "http://opcfoundation.org/UA/", "urn:server", "urn:other", "urn:unused", "urn:plant"
+    ]"#;
+
+    fn device_config(namespaces: &str, points: &str) -> String {
+        format!(
+            r#"[[device]]
+protocol_address = {{ endpoint = "opc.tcp://host:4840"{namespaces} }}
+{points}
+[[task]]
+mode = "subscribe"
+"#
+        )
+    }
+
+    #[test]
+    fn device_normalizes_connection_and_points() {
+        let text = device_config(
+            NAMESPACES,
+            &format!("{POINT}\nname = 'Temperature'\npath = 'Machine/Temperature'\nmode = 'poll'"),
+        )
+        .replace(
+            "[[device]]",
+            r#"[[device]]
+name = "Boiler"
+user = "operator"
+password = "env:OPCUA_PASSWORD"
+security_policy = "Basic256Sha256"
+security_mode = "SignAndEncrypt"
+cert = "client.pem"
+key = "client.key"
+trust_server = true
+pki_dir = "pki"
+timeout = "7s"
+retry = 9
+cache = "cache"
+"#,
+        );
+        let config: AcquireConfig = toml::from_str(&text).unwrap();
+        let connection = config.connection_args().unwrap();
+        assert_eq!(connection.endpoint.as_deref(), Some("opc.tcp://host:4840"));
+        assert_eq!(config.connection.name.as_deref(), Some("Boiler"));
+        assert_eq!(connection.user.as_deref(), Some("operator"));
+        assert_eq!(connection.password.as_deref(), Some("env:OPCUA_PASSWORD"));
+        assert_eq!(
+            connection.security_policy,
+            SecurityPolicyArg::Basic256Sha256
+        );
+        assert_eq!(connection.security_mode, SecurityModeArg::SignAndEncrypt);
+        assert_eq!(connection.cert, Some(PathBuf::from("client.pem")));
+        assert_eq!(connection.key, Some(PathBuf::from("client.key")));
+        assert_eq!(connection.pki_dir, Some(PathBuf::from("pki")));
+        assert!(connection.trust_server);
+        assert_eq!(connection.timeout, Duration::from_secs(7));
+        assert_eq!(connection.retry, 9);
+        assert_eq!(connection.cache, Some(PathBuf::from("cache")));
+        let node = &config.selection.nodes[0];
+        assert_eq!(node.id, "ns=4;i=123");
+        assert_eq!(node.namespace.as_deref(), Some("urn:plant"));
+        assert_eq!(node.name.as_deref(), Some("Temperature"));
+        assert_eq!(node.path.as_deref(), Some("Machine/Temperature"));
+        assert_eq!(node.mode, NodeMode::Poll);
+    }
+
+    #[test]
+    fn device_optional_name_and_namespace_table_keep_literal_ids() {
+        let config = AcquireConfig::from_toml(&device_config("", POINT)).unwrap();
+        assert!(config.connection.name.is_none());
+        let node = &config.selection.nodes[0];
+        assert_eq!(node.id, "ns=4;i=123");
+        assert!(node.name.is_none());
+        assert!(node.namespace.is_none());
+        assert_eq!(node.mode, NodeMode::Auto);
+        let text = device_config("", POINT).replace(
+            r#"protocol_address = { endpoint = "opc.tcp://host:4840" }"#,
+            "[device.protocol_address]\nendpoint = 'opc.tcp://host:4840'",
+        );
+        assert!(text.contains("[device.protocol_address]"));
+        assert!(AcquireConfig::from_toml(&text).is_ok());
+    }
+
+    #[test]
+    fn device_rejects_mixed_legacy_fields_by_presence() {
+        for prefix in [
+            "[connection]\n",
+            "[connection]\nname = 'legacy'\n",
+            "[selection]\nnode_ids = []\n",
+            "[selection]\nnode = []\n",
+        ] {
+            let error = AcquireConfig::from_toml(&format!("{prefix}{}", device_config("", POINT)))
+                .unwrap_err();
+            assert!(error.contains("cannot be combined"), "{error}");
+        }
+        let config = AcquireConfig::from_toml(&format!(
+            "[selection]\ninclude = ['**/Temperature']\n{}",
+            device_config("", POINT)
+        ))
+        .unwrap();
+        assert_eq!(config.selection.include, ["**/Temperature"]);
+        assert_eq!(config.selection.nodes.len(), 1);
+    }
+
+    #[test]
+    fn device_requires_exactly_one_device_when_present() {
+        let multiple = device_config("", POINT).replace(
+            "[[task]]",
+            "[[device]]\nprotocol_address = { endpoint = 'opc.tcp://other:4840' }\n[[task]]",
+        );
+        for text in ["device = []\n[[task]]\nmode = 'scan'\n", &multiple] {
+            let error = AcquireConfig::from_toml(text).unwrap_err();
+            assert!(error.contains("exactly one [[device]]"), "{error}");
+        }
+    }
+
+    #[test]
+    fn device_validates_namespace_table_without_compacting_or_deduplicating() {
+        for namespaces in [
+            ", namespaces = []",
+            ", namespaces = {}",
+            ", namespaces = ['urn:wrong-base', 'urn:plant']",
+            ", namespaces = ['http://opcfoundation.org/UA/', '']",
+            ", namespaces = ['http://opcfoundation.org/UA/', '  ']",
+            ", namespaces = ['http://opcfoundation.org/UA/', 42]",
+            ", namespaces = ['http://opcfoundation.org/UA/']",
+        ] {
+            assert!(
+                AcquireConfig::from_toml(&device_config(namespaces, POINT)).is_err(),
+                "accepted {namespaces}"
+            );
+        }
+        let namespaces = r#", namespaces = [
+            "http://opcfoundation.org/UA/", "urn:z", "urn:z", "urn:a", "urn:target"
+        ]"#;
+        let config = AcquireConfig::from_toml(&device_config(namespaces, POINT)).unwrap();
+        assert_eq!(
+            config.selection.nodes[0].namespace.as_deref(),
+            Some("urn:target")
+        );
+    }
+
+    #[test]
+    fn device_validates_logical_keys_and_addresses() {
+        for points in [
+            POINT.replace("logical-temperature", ""),
+            POINT.replace("logical-temperature", "  "),
+            format!("{POINT}{POINT}"),
+            POINT.replace("ns=4;i=123", "not-a-node"),
+            POINT.replace("ns=4;i=123", "ns=65536;i=123"),
+            POINT.replace("ns=4;i=123", "ns=4;i=not-numeric"),
+            POINT.replace(
+                "node_id = \"ns=4;i=123\"",
+                "node_id = 'ns=4;i=123', namespace = 'urn:plant'",
+            ),
+        ] {
+            assert!(AcquireConfig::from_toml(&device_config("", &points)).is_err());
+        }
+    }
+
+    #[test]
+    fn device_namespace_zero_stays_implicit_or_explicit() {
+        for id in ["i=123", "ns=0;i=123"] {
+            let config = AcquireConfig::from_toml(&device_config(
+                NAMESPACES,
+                &POINT.replace("ns=4;i=123", id),
+            ))
+            .unwrap();
+            assert_eq!(config.selection.nodes[0].id, id);
+            assert!(config.selection.nodes[0].namespace.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_validates_node_ids_and_namespace_zero_declarations() {
+        for selection in [
+            "[selection]\nnode_ids = ['bad-node']",
+            "[[selection.node]]\nid = 'bad-node'",
+            "[[selection.node]]\nid = 'i=123'\nnamespace = 'urn:wrong'",
+            "[[selection.node]]\nid = 'ns=0;i=123'\nnamespace = 'urn:wrong'",
+            "[[selection.node]]\nid = 'ns=2;i=123'\nnamespace = '  '",
+        ] {
+            assert!(
+                AcquireConfig::from_toml(&format!("{selection}\n[[task]]\nmode = 'subscribe'"))
+                    .is_err(),
+                "accepted {selection}"
+            );
+        }
+        let config = AcquireConfig::from_toml(
+            r#"[[selection.node]]
+id = "ns=4;s=Temperature"
+namespace = "urn:plant"
+[[selection.node]]
+id = "i=123"
+namespace = "http://opcfoundation.org/UA/"
+[[task]]
+mode = "subscribe"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.selection.nodes[0].namespace.as_deref(),
+            Some("urn:plant")
+        );
+    }
 
     #[test]
     fn parses_all_task_modes() {

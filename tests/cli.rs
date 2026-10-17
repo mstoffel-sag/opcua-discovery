@@ -323,3 +323,138 @@ interval = "300ms"
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn acquire_device_remaps_namespaces_and_caches_paths_by_address() {
+    let endpoint = common::start();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("device.toml");
+    let cache = dir.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let cache_key: String = endpoint
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    // An earlier session's table must never drive current-session acquisition.
+    std::fs::write(
+        cache.join(format!("{cache_key}.namespaces.json")),
+        serde_json::to_string(&serde_json::json!({
+            "endpoint": endpoint,
+            "uris": ["http://opcfoundation.org/UA/", common::TEST_NS]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config = format!(
+        r#"# preserve this comment
+[[device]]
+name = "Local fixture"
+trust_server = true
+pki_dir = "{pki}"
+cache = "{cache}"
+protocol_address = {{ endpoint = "{endpoint}", namespaces = [
+    "http://opcfoundation.org/UA/", "urn:config:one", "urn:config:two",
+    "urn:config:three", "{namespace}"
+] }}
+
+[[device.point]]
+id = "stable-temperature-key"
+name = "Temperature alias"
+address = {{ node_id = "ns=4;s=Temperature" }}
+mode = "poll"
+
+[output]
+format = "ndjson"
+
+[[task]]
+mode = "poll"
+interval = "100ms"
+"#,
+        pki = dir.path().join("pki").display(),
+        cache = cache.display(),
+        namespace = common::TEST_NS,
+    );
+    std::fs::write(&config_path, config).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_opcua-scan"))
+        .args([
+            "acquire",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--duration",
+            "300ms",
+        ])
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run acquire");
+    // Duration expiry uses the existing cancellation exit code.
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "acquire failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let sample: Value = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["value"] == 25.0)
+        .unwrap_or_else(|| panic!("no remapped Temperature sample: {stdout}"));
+    assert_eq!(sample["nodeId"], "ns=2;s=Temperature");
+    assert!(sample["key"].as_str().unwrap().ends_with("Temperature"));
+    assert_eq!(sample["meta"]["source"]["name"], "Local fixture");
+    let saved = std::fs::read_to_string(&config_path).unwrap();
+    assert!(saved.contains("# preserve this comment"));
+    let saved: toml::Value = toml::from_str(&saved).unwrap();
+    let point = &saved["device"][0]["point"][0];
+    assert_eq!(point["id"].as_str(), Some("stable-temperature-key"));
+    assert_eq!(
+        point["address"]["node_id"].as_str(),
+        Some("ns=4;s=Temperature")
+    );
+    assert!(point["path"].as_str().unwrap().ends_with("Temperature"));
+}
+
+#[test]
+fn acquire_device_missing_namespace_fails_without_literal_index_fallback() {
+    let endpoint = common::start();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("missing.toml");
+    let config = format!(
+        r#"[[device]]
+trust_server = true
+pki_dir = "{pki}"
+protocol_address = {{ endpoint = "{endpoint}", namespaces = [
+    "http://opcfoundation.org/UA/", "urn:config:one", "urn:absent-on-server"
+] }}
+[[device.point]]
+id = "temperature"
+address = {{ node_id = "ns=2;s=Temperature" }}
+[output]
+format = "ndjson"
+[[task]]
+mode = "poll"
+interval = "100ms"
+"#,
+        pki = dir.path().join("pki").display(),
+    );
+    std::fs::write(&config_path, config).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_opcua-scan"))
+        .args([
+            "acquire",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--duration",
+            "100ms",
+        ])
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run acquire");
+    assert!(!out.status.success(), "missing URI must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("urn:absent-on-server"), "{stderr}");
+    assert!(stderr.contains("ns=2;s=Temperature"), "{stderr}");
+    assert!(
+        out.stdout.is_empty(),
+        "must not sample the literal ns=2 node"
+    );
+}

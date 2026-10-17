@@ -28,7 +28,15 @@
 7. **Subscribable heuristic** is deliberately minimal: a readable `Variable`. Servers may still reject
    monitoring; use `--validate-subscription` / `auto` fallback to poll. **[Confirmed]**
 8. **Namespace indexes are session-local**; the tool standardizes on **URIs** in paths and remaps
-   explicit node ids by URI. Legacy `node_ids` (bare strings) are **not** remapped. **[Confirmed]**
+   device point addresses through a full ordered config-local URI array. Missing mappings fail
+   safely without numeric fallback when an array is supplied; arrays must not be sorted,
+   compacted, or deduplicated. Without an array, preferred and legacy addresses retain literal
+   indexes; implicit/explicit namespace 0 is fixed to the standard OPC UA URI. Legacy rich node
+   selectors retain their optional URI mapping; legacy `node_ids` (bare strings) are **not**
+   remapped. Acquisition and `browse --tui` / `browse --config` bypass disk namespace caches
+   and read the active session table; other browse caching is unchanged.
+   Acquisition resolves once per run: client session retries do not refresh the
+   namespace table or re-resolve points after reconnect.
 9. Retryable status set (`BadTimeout`, `BadTooManyOperations`, `BadServerTooBusy`,
    `BadNoContinuationPoints`, `BadServerNotConnected`) is the engine's definition of "transient".
    Other errors are counted and skipped, not retried. **[Confirmed]**

@@ -55,6 +55,26 @@ and acquire traverse into unmarked nodes only as needed.
 - **Acquire:** collect readable Variables under marks, then either `update_selection_in_toml`
   (editing an existing `source_config`) or `generate_toml` (new config); if editing, prompt for
   `<poll|subscribe> <interval>`. See [acquire.md](acquire.md) `generate.rs`.
+- **New config shape:** exactly one `[[device]]` (optional `name`), with security/connection
+  fields such as `trust_server` directly on it and
+  `protocol_address = { endpoint = "...", namespaces = [<full ordered URI table>] }`.
+  Each `[[device.point]]` has a stable unique node-derived logical `id`,
+  `address = { node_id = "ns=N;i=..." }`, and optional `name`, `mode`, `path`.
+  Logical ids are not measurement names; omitted names retain the prior fallback.
+- **Open/edit:** `browse --config FILE --tui` accepts preferred and legacy files. Match marks
+  using resolved OPC UA addresses/paths, not logical ids. Device point addresses use
+  config-local namespace indexes mapped through URIs to live indexes; missing mappings
+  fail safely, with no numeric fallback when an array is supplied. Without `namespaces`,
+  preferred and legacy addresses keep literal indexes (legacy per-node URI mapping still
+  applies). Implicit/explicit namespace 0 is fixed to the standard OPC UA URI.
+  Saving retained points preserves their logical ids,
+  names, modes, and cached paths, and preserves unrelated task/output/acquire/filter settings.
+  Never sort, compact, or deduplicate the shared namespace array; map new live nodes back
+  into config-local slots. `browse --tui` and `browse --config` read the active session's
+  NamespaceTable, bypassing potentially stale disk cache data for remapping/generation.
+- **Scope:** multiple devices require separate files (`acquire --config-dir DIR`). Modes and
+  cached paths are tool-specific extensions, not full tedge-dot compatibility; config
+  generation adds no MQTT publishing or security guarantees.
 
 ## Integrations
 Uses `opcua::browse` (lazy children), `opcua::value` (preview), `subscription` (validate),

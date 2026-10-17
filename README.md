@@ -15,7 +15,7 @@ Built in Rust on top of [`async-opcua`](https://github.com/freeopcua/async-opcua
 
 ## Features
 
-- **Four commands**: `connect`, `browse` (primary), `search`, `sample`.
+- **Five commands**: `connect`, `browse` (primary), `search`, `sample`, `acquire`.
 - **Concurrent traversal**: BFS or DFS with a bounded worker pool, continuation-point
   pagination, retry with backoff on transient failures, and cycle protection.
 - **Depth control**: limit traversal depth or go `unlimited`.
@@ -160,14 +160,79 @@ Keys:
 Marked nodes are written into the generated `acquire` config with their chosen
 mode. Nodes marked with `space` (auto) follow the config's default mode —
 subscribe when the server supports monitoring the node, otherwise poll.
+New configs use `[[device]]` / `[[device.point]]` with a shared namespace URI
+array. Editing a config retains point logical ids and names and writes cached
+paths back to the corresponding points; legacy configs remain readable.
 
 The terminal is always restored on exit, even on panic.
 
 ---
 
-## Acquisition modes: subscribe vs poll
+## Acquisition config and modes: subscribe vs poll
 
-`acquire` configs select **per-node** how each variable is read:
+Run one device per file, or multiple device files via a directory:
+
+```bash
+opcua-scan acquire --config examples/acquire-demo.toml --duration 3s
+opcua-scan acquire --config-dir ./devices
+opcua-scan browse --config test.toml --tui
+```
+
+The preferred syntax is `[[device]]` with an optional source `name`, connection
+and security fields directly on the device, and `protocol_address` containing
+the endpoint and a **full, ordered** config-local namespace URI array.
+Each `[[device.point]]` has a unique logical `id` and an OPC UA
+`address.node_id`; optional `name`, `mode`, and cached `path` retain their
+existing meanings. Logical ids identify config entries, **not output names**:
+output naming still uses `name` or the previous browse-name/NodeId fallback,
+with the existing path-based key behavior.
+
+```toml
+[[device]]
+name = "SampleServer"       # optional; source metadata, not a measurement name
+trust_server = true         # insecure; public demo/lab only
+protocol_address = { endpoint = "opc.tcp://opcua.demo-this.com:51210/UA/SampleServer", namespaces = ["http://opcfoundation.org/UA/"] }
+
+[[device.point]]
+id = "server-current-time"  # unique logical key, not the OPC UA NodeId
+address = { node_id = "i=2258" }
+name = "CurrentTime"        # optional output name
+mode = "poll"
+
+[output]
+format = "ndjson"
+
+[[task]]
+mode = "poll"
+interval = "1s"
+```
+
+The example only uses namespace 0, whose URI is always
+`http://opcfoundation.org/UA/`. For `ns=N` addresses, array slot `N` is the
+configured URI; it is resolved to the live server's namespace index before
+use. Keep every preceding slot, not just the selected namespaces: never sort,
+compact, or deduplicate the array. Missing slots or URIs fail safely rather
+than falling back to the numeric index when an array is supplied. If
+`namespaces` is absent, preferred and legacy addresses keep literal numeric
+indexes (legacy per-node `namespace` URI mappings still apply when supplied).
+Implicit namespace 0 (`i=...`) and explicit `ns=0` always mean the fixed
+standard OPC UA namespace; array slot 0 must contain its standard URI.
+For example, [`test.toml`](test.toml) retains the demo server's full nine-entry
+table for its namespace 4 and 5 points.
+
+Acquisition and `browse --tui` / `browse --config` read the namespace table
+from the **active session**, bypassing the disk namespace cache so a stale
+cache cannot drive remapping or config generation. Other browse runs retain
+their existing cache behavior.
+
+Exactly **one** device is supported per file; use `--config-dir` for multiple
+devices. Legacy `[connection]`, `[selection].node_ids`, and
+`[[selection.node]]` configs remain supported. Top-level `[[task]]`,
+`[output]`, `[acquire]`, and `[selection]` discovery
+filters are unchanged. Do not mix legacy connection/explicit-node syntax
+with the preferred device syntax.
+
+`acquire` configs select **per-point** how each variable is read:
 
 - **subscribe** — the server pushes value changes via an OPC UA monitored item
   (efficient; preferred for most variables).
@@ -179,19 +244,24 @@ The terminal is always restored on exit, even on panic.
 Set the mode per node, choose a default, or force polling globally:
 
 ```toml
-[acquire]
-default_mode = "auto"   # auto | subscribe | poll  (applied to nodes without a mode)
-poll_only    = false    # true disables all subscriptions (same as --poll-only)
+[[device]]
+protocol_address = { endpoint = "opc.tcp://localhost:4840", namespaces = ["http://opcfoundation.org/UA/", "urn:example:factory"] }
 
-[[selection.node]]
-id = "ns=3;i=1001"
+[[device.point]]
+id = "temperature"
+address = { node_id = "ns=1;i=1001" }
 name = "Temperature"
 mode = "subscribe"      # subscribe | poll | auto (omit = auto)
 
-[[selection.node]]
-id = "ns=3;i=1002"
+[[device.point]]
+id = "legacy-counter"
+address = { node_id = "ns=1;i=1002" }
 name = "LegacyCounter"
 mode = "poll"
+
+[acquire]
+default_mode = "auto"   # auto | subscribe | poll  (applied to nodes without a mode)
+poll_only    = false    # true disables all subscriptions (same as --poll-only)
 
 # Task blocks supply the parameters for each mode; nodes are routed to the
 # matching task by their resolved mode (a run can poll and subscribe at once).
@@ -213,6 +283,18 @@ opcua-scan acquire --config acquire.toml --poll-only
 When `[acquire].default_mode` is omitted it is inferred from the tasks present
 (only a poll task → poll everything; only a subscribe task → subscribe
 everything), so existing single-task configs are unchanged.
+
+These `poll` / `subscribe` / `auto` modes and cached `path` fields are
+tool-specific extensions, not a promise of full tedge-dot config compatibility.
+This syntax does not replace the acquisition engine or output sinks and adds
+neither MQTT publishing nor new security guarantees. `trust_server` remains
+insecure and opt-in.
+
+**Reconnect limitation:** acquisition connects, loads namespaces, and resolves
+points once per run. The underlying OPC UA client has session retries, but the
+runner does not reload namespaces or re-resolve points after reconnection.
+Restart acquisition after server namespace-table changes; remapping is not
+continuous reconnect recovery.
 
 ---
 
