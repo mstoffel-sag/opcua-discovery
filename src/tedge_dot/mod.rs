@@ -6,4 +6,5 @@
 
 pub mod connection;
 pub mod library;
+pub mod points;
 pub mod schema;

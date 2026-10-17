@@ -140,6 +140,7 @@ async fn resolve_explicit(
         cached_path: Option<String>,
         config_id: Option<String>,
         mode: NodeMode,
+        key: Option<String>,
     }
     let mut parsed: Vec<Parsed> = Vec::with_capacity(nodes.len() + legacy_ids.len());
     for node in nodes {
@@ -150,6 +151,7 @@ async fn resolve_explicit(
             cached_path: node.path.clone().filter(|s| !s.is_empty()),
             config_id: Some(node.id.clone()),
             mode: node.mode,
+            key: node.key.clone(),
         });
     }
     for id in legacy_ids {
@@ -161,6 +163,7 @@ async fn resolve_explicit(
             cached_path: None,
             config_id: None,
             mode: NodeMode::Auto,
+            key: None,
         });
     }
 
@@ -218,6 +221,7 @@ async fn resolve_explicit(
             eu_range: None,
             source_endpoint: None,
             source_name: None,
+            key: p.key.clone(),
         };
         out.push(SelectedNode {
             path: browse_path.unwrap_or_else(|| name_or_id(&attr.display_name, &p.id)),
@@ -310,6 +314,7 @@ async fn resolve_filtered(
                     eu_range: None,
                     source_endpoint: None,
                     source_name: None,
+                    key: None,
                 };
                 nodes.push(SelectedNode {
                     name: measurement_name(&record),

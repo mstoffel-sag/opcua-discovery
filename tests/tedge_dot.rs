@@ -487,3 +487,189 @@ fn method_records_carry_their_object() {
         .unwrap()
         .ends_with(";s=Machine"));
 }
+
+// --- acquire from a tedge-dot config ----------------------------------------
+
+/// A tedge-dot config dir for the test server: device `motor` with library
+/// `motor` (whose namespace table puts the test namespace at index 3, one
+/// higher than the server, so translation is exercised) and an inline
+/// `counter` point that is polled.
+fn acquire_setup(endpoint: &str, library_ns: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("lib/opcua")).unwrap();
+    std::fs::write(
+        dir.path().join("lib/opcua/motor.toml"),
+        format!(
+            r#"[library]
+protocol = "opcua"
+namespaces = ["http://opcfoundation.org/UA/", "urn:opcua-scan-test-server", "urn:not-on-the-server", "{library_ns}"]
+
+[[point]]
+id = "temperature"
+datatype = "float64"
+address = {{ node_id = "ns=3;s=Temperature" }}
+
+[[point]]
+id = "speed"
+datatype = "float32"
+address = {{ node_id = "ns=3;s=Speed" }}
+
+[[point]]
+id = "start"
+access = "call_method"
+address = {{ object_id = "i=85", method_id = "ns=3;s=Start" }}
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("opcua.toml"),
+        format!(
+            r#"[connector]
+protocol = "opcua"
+point_library_path = ["lib"]
+poll_interval = "500ms"
+
+[[device]]
+name = "motor"
+protocol_address = {{ endpoint = "{endpoint}", namespaces = ["http://opcfoundation.org/UA/", "urn:opcua-scan-test-server", "{TEST_NS}"] }}
+points_from = ["motor"]
+
+  [[device.point]]
+  id = "counter"
+  datatype = "int32"
+  subscribe = false
+  address = {{ node_id = "ns=2;s=Counter" }}
+"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+/// A bounded acquire run ends through the cancel flag, which the binary
+/// reports as exit code 4 (as after Ctrl+C); 0 and 4 both mean it ran.
+fn assert_ran(out: &std::process::Output) {
+    assert!(
+        matches!(out.status.code(), Some(0 | 4)),
+        "exit {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn acquire(dir: &Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec![
+        "acquire",
+        "--tedge-dot-config",
+        "opcua.toml",
+        "--duration",
+        "2s",
+    ];
+    args.extend_from_slice(extra);
+    std::process::Command::new(env!("CARGO_BIN_EXE_opcua-scan"))
+        .args(&args)
+        .current_dir(dir)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("run acquire")
+}
+
+/// The keys of every sample line printed in tedge format.
+fn sample_keys(stdout: &[u8]) -> std::collections::BTreeSet<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .flat_map(|v| {
+            v.as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .filter(|k| k != "time" && k != "meta")
+        .collect()
+}
+
+#[test]
+fn acquire_reads_the_devices_points_by_id() {
+    let endpoint = common::start();
+    let dir = acquire_setup(&endpoint, TEST_NS);
+    let before = std::fs::read(dir.path().join("opcua.toml")).unwrap();
+    let library_before = std::fs::read(dir.path().join("lib/opcua/motor.toml")).unwrap();
+
+    let out = acquire(dir.path(), &[]);
+    assert_ran(&out);
+    let keys = sample_keys(&out.stdout);
+    assert_eq!(
+        keys,
+        ["counter", "speed", "temperature"].map(String::from).into(),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // The method point is reported, not acquired.
+    assert!(String::from_utf8_lossy(&out.stderr).contains("method point"));
+    // Read-only: neither file was touched.
+    assert_eq!(
+        std::fs::read(dir.path().join("opcua.toml")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("lib/opcua/motor.toml")).unwrap(),
+        library_before
+    );
+}
+
+#[test]
+fn acquire_fails_when_a_namespace_is_missing_on_the_server() {
+    let endpoint = common::start();
+    let dir = acquire_setup(&endpoint, "urn:missing-namespace");
+    let out = acquire(dir.path(), &[]);
+    // A configuration error, not the duration's cancellation code.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("urn:missing-namespace"), "{stderr}");
+}
+
+#[test]
+fn acquire_extras_file_sets_tasks_and_output() {
+    let endpoint = common::start();
+    let dir = acquire_setup(&endpoint, TEST_NS);
+    std::fs::write(
+        dir.path().join("extras.toml"),
+        "[output]\nformat = \"ndjson\"\n\n[[task]]\nmode = \"poll\"\ninterval = \"300ms\"\n",
+    )
+    .unwrap();
+    let out = acquire(dir.path(), &["--config", "extras.toml", "--poll-only"]);
+    assert_ran(&out);
+    let keys: std::collections::BTreeSet<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["key"].as_str().map(String::from))
+        .collect();
+    assert_eq!(
+        keys,
+        ["counter", "speed", "temperature"].map(String::from).into()
+    );
+}
+
+#[test]
+fn acquire_extras_file_may_not_select_nodes() {
+    let endpoint = common::start();
+    let dir = acquire_setup(&endpoint, TEST_NS);
+    std::fs::write(
+        dir.path().join("extras.toml"),
+        "[selection]\nnode_ids = [\"i=2258\"]\n\n[[task]]\nmode = \"poll\"\ninterval = \"1s\"\n",
+    )
+    .unwrap();
+    let out = acquire(dir.path(), &["--config", "extras.toml"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[selection] is not allowed with --tedge-dot-config"),
+        "{stderr}"
+    );
+}

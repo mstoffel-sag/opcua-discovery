@@ -37,11 +37,11 @@ use sink::{Sample, SampleMeta, Sink};
 /// cached back into it.
 pub async fn run(
     config: AcquireConfig,
+    connection_args: crate::cli::ConnectionArgs,
     duration: Option<Duration>,
     config_path: Option<&std::path::Path>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
-    let connection_args = config.connection_args()?;
     let conn = Connection::connect(&connection_args).await?;
     let session = conn.session().clone();
 

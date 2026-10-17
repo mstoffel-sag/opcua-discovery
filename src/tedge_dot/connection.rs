@@ -221,7 +221,7 @@ fn resolve(
 }
 
 /// The `[[device]]` named `device`, or the only one.
-fn select_device<'a>(
+pub(crate) fn select_device<'a>(
     doc: &'a toml::Table,
     device: Option<&str>,
 ) -> std::result::Result<&'a toml::Table, String> {

@@ -16,7 +16,7 @@ use crate::cli::{
 use crate::error::{Result, ScanError};
 
 /// A fully parsed acquisition configuration (one TOML file).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcquireConfig {
     /// Connection / security settings.
@@ -87,6 +87,29 @@ impl AcquireConfig {
         let config: AcquireConfig = toml::from_str(text).map_err(|e| e.to_string())?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// The acquire-only settings that may accompany `--tedge-dot-config`:
+    /// `[acquire]`, `[output]` and `[[task]]`. Connection and selection come
+    /// from the tedge-dot config, so any other table is an error.
+    pub fn extras_from_file(path: &Path) -> Result<Self> {
+        let config_err = |reason: String| ScanError::Config {
+            path: path.to_path_buf(),
+            reason,
+        };
+        let text = std::fs::read_to_string(path).map_err(|e| config_err(e.to_string()))?;
+        let table: toml::Table = text
+            .parse()
+            .map_err(|e: toml::de::Error| config_err(e.to_string()))?;
+        if let Some(key) = table
+            .keys()
+            .find(|k| !matches!(k.as_str(), "acquire" | "output" | "task"))
+        {
+            return Err(config_err(format!(
+                "[{key}] is not allowed with --tedge-dot-config; only [acquire], [output] and [[task]] are"
+            )));
+        }
+        toml::from_str(&text).map_err(|e: toml::de::Error| config_err(e.to_string()))
     }
 
     fn validate(&self) -> std::result::Result<(), String> {
@@ -243,7 +266,7 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    fn to_args(&self) -> Result<ConnectionArgs> {
+    pub fn to_args(&self) -> Result<ConnectionArgs> {
         Ok(ConnectionArgs {
             endpoint: self.endpoint.clone(),
             user: self.user.clone(),
@@ -405,6 +428,10 @@ pub struct NodeSelector {
     /// `auto`). Routes the node to the matching task at runtime.
     #[serde(default)]
     pub mode: NodeMode,
+    /// Output key of this node's samples (a tedge-dot point id). Not settable
+    /// from an acquire file; set when points come from `--tedge-dot-config`.
+    #[serde(skip)]
+    pub key: Option<String>,
 }
 
 /// `[output]` table.
@@ -581,6 +608,46 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    fn extras(text: &str) -> Result<AcquireConfig> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        AcquireConfig::extras_from_file(file.path())
+    }
+
+    #[test]
+    fn extras_file_takes_acquire_output_and_tasks() {
+        let config = extras(
+            "[acquire]\npoll_only = true\n[output]\nformat = \"csv\"\n[[task]]\nmode = \"poll\"\ninterval = \"2s\"\n",
+        )
+        .unwrap();
+        assert!(config.acquire.poll_only);
+        assert_eq!(config.tasks.len(), 1);
+        // No tasks is fine: the tedge-dot defaults fill them in.
+        assert!(extras("[output]\nformat = \"ndjson\"\n")
+            .unwrap()
+            .tasks
+            .is_empty());
+    }
+
+    #[test]
+    fn extras_file_refuses_connection_and_selection() {
+        for table in ["connection", "selection"] {
+            let err = extras(&format!("[{table}]\n")).unwrap_err().to_string();
+            assert!(err.contains(&format!("[{table}] is not allowed")), "{err}");
+        }
+    }
+
+    #[test]
+    fn node_key_cannot_be_set_from_a_file() {
+        let err = AcquireConfig::from_toml(
+            "[[selection.node]]\nid = \"i=2258\"\nkey = \"x\"\n[[task]]\nmode = \"poll\"\ninterval = \"1s\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("key"), "{err}");
+    }
+
     use super::*;
 
     #[test]

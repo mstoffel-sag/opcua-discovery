@@ -217,6 +217,31 @@ opcua-scan browse --tedge-dot-config opcua.toml --device plc-7 --tui --library a
   is required for an unprotected password. Server-certificate trust stays in opcua-scan's own
   PKI (`--pki-dir`).
 
+### Acquire a tedge-dot device's points
+
+The same point list drives `opcua-scan acquire`, so there is one list to maintain:
+
+```bash
+# Read the device's points (points_from libraries + inline points) for 30 s
+opcua-scan acquire --tedge-dot-config /etc/tedge/plugins/ot/opcua.toml --device plc-7 --duration 30s
+
+# Add acquire-only settings: history, other intervals, CSV/NDJSON files
+opcua-scan acquire --tedge-dot-config opcua.toml --device plc-7 --config extras.toml
+```
+
+- Libraries are found like tedge-dot finds them (`[connector] point_library_path`, else
+  `TEDGE_DOT_POINT_LIBRARY_PATH`, else `/etc/tedge/plugins/ot/points.d` and
+  `/usr/share/tedge-dot/points.d`, file `<dir>/opcua/<name>.toml`); inline points override
+  library points with the same `id`.
+- Node ids are translated through their namespace table (library, else device) to the server's
+  current index; a namespace the server does not list stops the run.
+- `subscribe = false` points are polled, the rest subscribe when they can. Method, write-only,
+  disabled and `field`/`index` points are skipped with a warning. Samples are keyed by point `id`.
+- `extras.toml` may only contain `[acquire]`, `[output]` and `[[task]]`. Without tasks, a poll task
+  uses the device's (else connector's) `poll_interval` (default 2s) and a subscribe task its
+  `sampling_interval`. Per-point intervals are not applied. Nothing is written to the tedge-dot
+  files.
+
 ---
 
 ## Acquisition modes: subscribe vs poll
