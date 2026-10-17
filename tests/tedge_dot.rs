@@ -547,13 +547,12 @@ points_from = ["motor"]
     dir
 }
 
-/// A bounded acquire run ends through the cancel flag, which the binary
-/// reports as exit code 4 (as after Ctrl+C); 0 and 4 both mean it ran.
+/// A run bounded by `--duration` completes normally: exit code 0.
 fn assert_ran(out: &std::process::Output) {
-    assert!(
-        matches!(out.status.code(), Some(0 | 4)),
-        "exit {:?}: {}",
+    assert_eq!(
         out.status.code(),
+        Some(0),
+        "{}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -672,4 +671,48 @@ fn acquire_extras_file_may_not_select_nodes() {
         stderr.contains("[selection] is not allowed with --tedge-dot-config"),
         "{stderr}"
     );
+}
+
+#[test]
+fn acquire_samples_always_have_a_time() {
+    let endpoint = common::start();
+    let dir = acquire_setup(&endpoint, TEST_NS);
+    let out = acquire(dir.path(), &[]);
+    assert_ran(&out);
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(!lines.is_empty());
+    assert!(
+        lines.iter().all(|v| v["time"].as_str().is_some()),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn interrupted_acquire_exits_with_code_4() {
+    let endpoint = common::start();
+    let dir = acquire_setup(&endpoint, TEST_NS);
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_opcua-scan"))
+        .args([
+            "acquire",
+            "--tedge-dot-config",
+            "opcua.toml",
+            "--duration",
+            "60s",
+        ])
+        .current_dir(dir.path())
+        .env("RUST_LOG", "error")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn acquire");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let killed = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send SIGINT");
+    assert!(killed.success());
+    let out = child.wait_with_output().expect("wait for acquire");
+    assert_eq!(out.status.code(), Some(4));
 }

@@ -42,6 +42,44 @@ pub async fn run(
     config_path: Option<&std::path::Path>,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
+    // `cancel` is the process-wide Ctrl+C flag, which `main` reports as exit
+    // code 4. The duration must end the run without looking like an
+    // interruption, so the tasks watch a run-local flag that follows Ctrl+C
+    // and is also set by the duration timer.
+    let signal = cancel;
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let (signal, cancel) = (signal.clone(), cancel.clone());
+        tokio::spawn(async move {
+            while !cancel.load(Ordering::Relaxed) {
+                if signal.load(Ordering::Relaxed) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+    let result = run_tasks(
+        config,
+        connection_args,
+        duration,
+        config_path,
+        cancel.clone(),
+    )
+    .await;
+    // Ends the watcher, so no watcher outlives its run (--config-dir runs several).
+    cancel.store(true, Ordering::Relaxed);
+    result
+}
+
+/// The body of [`run`], with the run-local stop flag as `cancel`.
+async fn run_tasks(
+    config: AcquireConfig,
+    connection_args: crate::cli::ConnectionArgs,
+    duration: Option<Duration>,
+    config_path: Option<&std::path::Path>,
+    cancel: Arc<AtomicBool>,
+) -> Result<()> {
     let conn = Connection::connect(&connection_args).await?;
     let session = conn.session().clone();
 

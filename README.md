@@ -406,11 +406,14 @@ opcua-scan browse --profile plant --subscribable --output csv --file plant.csv
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success |
+| `0` | Success (also an `acquire` run that ends because its `--duration` elapsed) |
 | `1` | General failure |
 | `2` | Invalid usage / arguments |
 | `3` | Connection failure |
-| `4` | Cancelled (Ctrl+C) |
+| `4` | Cancelled (Ctrl+C), also during an `acquire --duration` run |
+
+Acquired samples always carry a `time`: the source timestamp, else the server timestamp, else
+the time opcua-scan received the value (some servers send neither).
 
 ---
 
