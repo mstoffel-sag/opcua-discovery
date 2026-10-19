@@ -143,11 +143,7 @@ pub fn eu_label_from_data_value(dv: &DataValue) -> Option<String> {
         Variant::ExtensionObject(obj) => {
             let eu = obj.inner_as::<EUInformation>()?;
             let label = eu.display_name.text.to_string();
-            if label.is_empty() {
-                None
-            } else {
-                Some(label)
-            }
+            if label.is_empty() { None } else { Some(label) }
         }
         _ => None,
     }

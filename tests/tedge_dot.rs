@@ -5,7 +5,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{run_cli, run_cli_ok, TEST_NS, TEST_PASSWORD, TEST_USER};
+use common::{TEST_NS, TEST_PASSWORD, TEST_USER, run_cli, run_cli_ok};
 
 /// Browse the test server's Factory subtree as a point library into `file`.
 fn export(endpoint: &str, file: &Path, extra: &[&str]) -> std::process::Output {
@@ -396,10 +396,12 @@ fn library_covers_structures_enums_derived_types_and_methods() {
     let speed = point(&pts, "speed");
     assert_eq!(speed["address"]["field"].as_str(), Some("Speed"));
     assert_eq!(speed["datatype"].as_str(), Some("float64"));
-    assert!(speed["address"]["node_id"]
-        .as_str()
-        .unwrap()
-        .ends_with(";s=Pump1.Status"));
+    assert!(
+        speed["address"]["node_id"]
+            .as_str()
+            .unwrap()
+            .ends_with(";s=Pump1.Status")
+    );
     let current = point(&pts, "motor_current");
     assert_eq!(current["address"]["field"].as_str(), Some("Motor.Current"));
     assert_eq!(current["datatype"].as_str(), Some("float32"));
@@ -441,10 +443,12 @@ fn library_covers_structures_enums_derived_types_and_methods() {
     // Methods.
     let multiply = point(&pts, "multiply");
     assert_eq!(multiply["access"].as_str(), Some("call_method"));
-    assert!(multiply["address"]["object_id"]
-        .as_str()
-        .unwrap()
-        .ends_with(";s=Machine"));
+    assert!(
+        multiply["address"]["object_id"]
+            .as_str()
+            .unwrap()
+            .ends_with(";s=Machine")
+    );
     let inputs: Vec<&str> = multiply["address"]["inputs"]
         .as_array()
         .unwrap()
@@ -482,10 +486,12 @@ fn method_records_carry_their_object() {
         .iter()
         .find(|r| r["browse_name"] == "Multiply")
         .expect("Multiply record");
-    assert!(multiply["parent_node_id"]
-        .as_str()
-        .unwrap()
-        .ends_with(";s=Machine"));
+    assert!(
+        multiply["parent_node_id"]
+            .as_str()
+            .unwrap()
+            .ends_with(";s=Machine")
+    );
 }
 
 // --- acquire from a tedge-dot config ----------------------------------------

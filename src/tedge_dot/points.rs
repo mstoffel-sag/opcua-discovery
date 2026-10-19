@@ -368,12 +368,12 @@ fn read_library(
         Some(other) => {
             return Err(format!(
                 "point library '{where_}' is for protocol '{other}', not 'opcua'"
-            ))
+            ));
         }
         None => {
             return Err(format!(
                 "point library '{where_}' has no [library] protocol"
-            ))
+            ));
         }
     }
     let namespaces = library

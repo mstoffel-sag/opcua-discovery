@@ -15,7 +15,7 @@ use opcua::types::{
     BrowseDescription, BrowseDirection, BrowseResult, BrowseResultMask, ByteString, NodeId,
     ReferenceDescription, ReferenceTypeId, StatusCode,
 };
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, trace};
 
 use crate::cli::{Depth, Strategy};

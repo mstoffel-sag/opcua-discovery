@@ -7,8 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use opcua::client::Session;
 use opcua::types::NodeId;
@@ -20,13 +20,13 @@ use crate::acquire::config::NodeMode;
 use crate::acquire::sink::SampleMeta;
 use crate::error::{Result, ScanError};
 use crate::export::NodeRecord;
-use crate::filters::predicate::{builtin_datatype_name, canonical_data_type, is_subscribable};
 use crate::filters::FilterSet;
+use crate::filters::predicate::{builtin_datatype_name, canonical_data_type, is_subscribable};
 use crate::opcua::attributes::read_node_attributes;
 use crate::opcua::browse::browse_properties;
 use crate::opcua::namespaces::NamespaceTable;
 use crate::opcua::value::{eu_label_from_data_value, range_from_data_value, read_data_values};
-use crate::scanner::{resolve_root, Engine, ScanConfig};
+use crate::scanner::{Engine, ScanConfig, resolve_root};
 
 /// A selected node ready for sampling.
 #[derive(Debug, Clone)]

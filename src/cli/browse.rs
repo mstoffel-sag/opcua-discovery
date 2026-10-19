@@ -1,7 +1,7 @@
 //! `browse` subcommand: the primary discovery command.
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use clap::Args;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -10,10 +10,10 @@ use tracing::info;
 
 use crate::cli::{ConnectionArgs, Encoding, FilterArgs, OutputArgs, TraversalArgs};
 use crate::error::Result;
-use crate::export::{render_display, write_export, NodeRecord};
+use crate::export::{NodeRecord, render_display, write_export};
 use crate::filters::FilterSet;
 use crate::opcua::{Connection, NamespaceTable};
-use crate::scanner::{resolve_root, Engine, ScanConfig};
+use crate::scanner::{Engine, ScanConfig, resolve_root};
 use crate::subscription;
 
 /// Arguments for the `browse` command.

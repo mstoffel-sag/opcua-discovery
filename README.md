@@ -43,7 +43,7 @@ cargo build --release
 # Binary at target/release/opcua-scan
 ```
 
-Requires a recent stable Rust toolchain (edition 2021, rustc ≥ 1.80).
+Requires a recent stable Rust toolchain (edition 2024, rustc ≥ 1.88).
 
 ---
 

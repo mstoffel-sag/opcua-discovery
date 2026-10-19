@@ -577,7 +577,7 @@ fn parse_node_class(s: &str) -> Result<NodeClassArg> {
         _ => {
             return Err(ScanError::InvalidArgument(format!(
                 "invalid node class '{v}'"
-            )))
+            )));
         }
     };
     Ok(class)
@@ -625,10 +625,12 @@ mod tests {
         assert!(config.acquire.poll_only);
         assert_eq!(config.tasks.len(), 1);
         // No tasks is fine: the tedge-dot defaults fill them in.
-        assert!(extras("[output]\nformat = \"ndjson\"\n")
-            .unwrap()
-            .tasks
-            .is_empty());
+        assert!(
+            extras("[output]\nformat = \"ndjson\"\n")
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
     }
 
     #[test]

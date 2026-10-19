@@ -2,8 +2,8 @@
 //! subscribe, history) against an OPC UA server.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use clap::Args;
@@ -57,7 +57,7 @@ pub async fn run(args: AcquireArgs, cancel: Arc<AtomicBool>) -> Result<()> {
         (None, None) => {
             return Err(ScanError::InvalidArgument(
                 "one of --config, --config-dir or --tedge-dot-config is required".into(),
-            ))
+            ));
         }
     };
 

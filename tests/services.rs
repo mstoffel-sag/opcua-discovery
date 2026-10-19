@@ -11,7 +11,7 @@ mod common;
 
 use serde_json::Value;
 
-use common::{json_records, run_cli, run_cli_ok, MOTOR_VARIABLES, TEST_NS};
+use common::{MOTOR_VARIABLES, TEST_NS, json_records, run_cli, run_cli_ok};
 
 /// Collect the `browse_name` of every record in a JSON array.
 fn browse_names(records: &[Value]) -> Vec<String> {

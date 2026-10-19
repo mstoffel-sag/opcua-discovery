@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{run_cli, run_cli_ok, SECURE_POLICIES, TEST_NS, TEST_PASSWORD, TEST_USER};
+use common::{SECURE_POLICIES, TEST_NS, TEST_PASSWORD, TEST_USER, run_cli, run_cli_ok};
 
 #[test]
 fn sign_handshake_succeeds_when_server_trusted() {

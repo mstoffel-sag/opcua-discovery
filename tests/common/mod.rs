@@ -23,9 +23,9 @@ use opcua::server::address_space::{
     DataTypeBuilder, MethodBuilder, ObjectBuilder, VariableBuilder,
 };
 use opcua::server::diagnostics::NamespaceMetadata;
-use opcua::server::node_manager::memory::{simple_node_manager, SimpleNodeManager};
+use opcua::server::node_manager::memory::{SimpleNodeManager, simple_node_manager};
 use opcua::server::{
-    ServerBuilder, ServerEndpoint, ServerHandle, ServerUserToken, ANONYMOUS_USER_TOKEN_ID,
+    ANONYMOUS_USER_TOKEN_ID, ServerBuilder, ServerEndpoint, ServerHandle, ServerUserToken,
 };
 use opcua::types::{
     Argument, DataTypeDefinition, DataTypeId, EnumDefinition, EnumField, MessageSecurityMode,
@@ -380,7 +380,8 @@ fn free_port() -> u16 {
 
 /// Block until the server is accepting TCP connections (or time out).
 fn wait_until_listening(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Generous: server start-up includes key generation, slow on shared CI runners.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
             // Give the OPC UA stack a brief moment after the socket is up.

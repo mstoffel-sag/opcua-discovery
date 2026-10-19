@@ -17,7 +17,7 @@ use std::time::Duration;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
 use opcua::client::Session;
@@ -34,9 +34,9 @@ use crate::acquire::config::NodeMode;
 use crate::acquire::generate::GenMode;
 use crate::cli::Encoding;
 use crate::error::{Result, ScanError};
-use crate::export::{write_export, NodeRecord};
-use crate::filters::{is_subscribable, FilterSet};
-use crate::opcua::attributes::{read_node_attributes, NodeAttributes};
+use crate::export::{NodeRecord, write_export};
+use crate::filters::{FilterSet, is_subscribable};
+use crate::opcua::attributes::{NodeAttributes, read_node_attributes};
 use crate::opcua::browse::browse_children;
 use crate::opcua::namespaces::NamespaceTable;
 use crate::opcua::node_class_name;
@@ -1202,7 +1202,9 @@ impl App {
                 .collect();
             if nodes.is_empty() {
                 self.status = if skipped > 0 {
-                    format!("no readable variables (skipped {skipped} non-readable) — mark nodes with space, then press a")
+                    format!(
+                        "no readable variables (skipped {skipped} non-readable) — mark nodes with space, then press a"
+                    )
                 } else {
                     "no variables marked or loaded — mark nodes with space, then press a".into()
                 };
@@ -1604,11 +1606,7 @@ impl App {
                 let node = &self.arena[idx];
                 let indent = "  ".repeat(node.depth.saturating_sub(1));
                 let marker = if node.expandable {
-                    if node.expanded {
-                        "▼ "
-                    } else {
-                        "▶ "
-                    }
+                    if node.expanded { "▼ " } else { "▶ " }
                 } else {
                     "  "
                 };

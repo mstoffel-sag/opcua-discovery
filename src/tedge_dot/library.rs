@@ -22,9 +22,9 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use opcua::types::{Identifier, NodeId};
-use toml_edit::{value, Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
-use super::schema::{builtin_shape, Schema, Shape};
+use super::schema::{Schema, Shape, builtin_shape};
 use crate::export::NodeRecord;
 use crate::opcua::namespaces::NamespaceTable;
 
@@ -525,11 +525,7 @@ fn id_of(segments: &[String], levels: usize) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("_");
-    if id.is_empty() {
-        "point".into()
-    } else {
-        id
-    }
+    if id.is_empty() { "point".into() } else { id }
 }
 
 /// Unique ids for `candidates`: the shortest path suffix that is unique among
@@ -1475,10 +1471,11 @@ transform = { multiplier = 0.1 }
             &schema,
         )
         .unwrap();
-        assert!(out
-            .skipped
-            .iter()
-            .any(|s| s.browse_path == "X" && s.reason.contains("no field")));
+        assert!(
+            out.skipped
+                .iter()
+                .any(|s| s.browse_path == "X" && s.reason.contains("no field"))
+        );
     }
 
     #[test]

@@ -516,12 +516,16 @@ mod tests {
             input_type(&arg("e", NodeId::new(2, 5u32), -1), &schema),
             Ok("int32")
         );
-        assert!(input_type(&arg("arr", NodeId::new(0, 6u32), 1), &schema)
-            .unwrap_err()
-            .contains("array"));
-        assert!(input_type(&arg("t", NodeId::new(0, 13u32), -1), &schema)
-            .unwrap_err()
-            .contains("DateTime"));
+        assert!(
+            input_type(&arg("arr", NodeId::new(0, 6u32), 1), &schema)
+                .unwrap_err()
+                .contains("array")
+        );
+        assert!(
+            input_type(&arg("t", NodeId::new(0, 13u32), -1), &schema)
+                .unwrap_err()
+                .contains("DateTime")
+        );
         assert!(input_type(&arg("b", NodeId::new(0, 15u32), -1), &schema).is_err());
     }
 }

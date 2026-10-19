@@ -109,7 +109,7 @@ impl Predicate {
                 None => {
                     return Err(ScanError::InvalidArgument(format!(
                         "namespace URI '{uri}' is not present on the server"
-                    )))
+                    )));
                 }
             }
         }

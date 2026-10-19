@@ -5,8 +5,8 @@ pub mod generate;
 pub mod selection;
 pub mod sink;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use opcua::client::Session;
@@ -18,11 +18,11 @@ use tracing::{info, warn};
 use crate::error::{Result, ScanError};
 use crate::export::NodeRecord;
 use crate::filters::FilterSet;
+use crate::opcua::Connection;
 use crate::opcua::history::{self, HistoryQuery};
 use crate::opcua::namespaces::NamespaceTable;
 use crate::opcua::value::read_readings;
-use crate::opcua::Connection;
-use crate::scanner::{resolve_root, Engine, ScanConfig};
+use crate::scanner::{Engine, ScanConfig, resolve_root};
 use crate::subscription::{self, SubscriptionParams};
 
 use config::{AcquireConfig, NodeMode, TaskConfig};

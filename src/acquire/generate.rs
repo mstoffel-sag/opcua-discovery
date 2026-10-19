@@ -311,7 +311,7 @@ pub fn update_selection_in_toml(original: &str, nodes: &[GenNode]) -> Result<Str
 /// node's `id` field. Preserves all other content (formatting, comments, tasks).
 /// `updates` is a list of `(node id, browse path)` pairs.
 pub fn update_node_paths_in_toml(original: &str, updates: &[(String, String)]) -> Result<String> {
-    use toml_edit::{value, DocumentMut};
+    use toml_edit::{DocumentMut, value};
 
     if updates.is_empty() {
         return Ok(original.to_string());
@@ -438,14 +438,18 @@ mod tests {
 
         let parsed = AcquireConfig::from_toml(&toml).expect("re-parse generated config");
         // Both poll and subscribe task blocks are present.
-        assert!(parsed
-            .tasks
-            .iter()
-            .any(|t| matches!(t, TaskConfig::Poll { .. })));
-        assert!(parsed
-            .tasks
-            .iter()
-            .any(|t| matches!(t, TaskConfig::Subscribe { .. })));
+        assert!(
+            parsed
+                .tasks
+                .iter()
+                .any(|t| matches!(t, TaskConfig::Poll { .. }))
+        );
+        assert!(
+            parsed
+                .tasks
+                .iter()
+                .any(|t| matches!(t, TaskConfig::Subscribe { .. }))
+        );
         // Per-node modes survive; the auto node has no explicit mode.
         let by_id = |id: &str| {
             parsed
