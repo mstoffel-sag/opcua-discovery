@@ -146,12 +146,11 @@ fn resolve(
         .get("connector")
         .and_then(|c| c.get("protocol"))
         .and_then(toml::Value::as_str)
+        && protocol != "opcua"
     {
-        if protocol != "opcua" {
-            return Err(format!(
-                "this is a tedge-dot config for '{protocol}', not 'opcua'"
-            ));
-        }
+        return Err(format!(
+            "this is a tedge-dot config for '{protocol}', not 'opcua'"
+        ));
     }
 
     let connection: Connection = match doc.get("connection") {

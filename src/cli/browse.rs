@@ -88,10 +88,10 @@ pub async fn run(mut args: BrowseArgs, cancel: Arc<AtomicBool>) -> Result<()> {
                 &namespaces,
             )?;
             selected_ids.insert(id.to_string());
-            if let Some(path) = &node.path {
-                if !path.is_empty() {
-                    selected_paths.insert(path.clone());
-                }
+            if let Some(path) = &node.path
+                && !path.is_empty()
+            {
+                selected_paths.insert(path.clone());
             }
         }
         // Legacy bare ids carry no URI: use them verbatim.

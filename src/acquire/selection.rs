@@ -432,11 +432,11 @@ async fn enrich_metadata(session: &Session, nodes: &mut Vec<SelectedNode>) -> Re
             continue;
         };
         folded.insert(node.node_id.clone());
-        if let Some((parent_path, _)) = node.path.rsplit_once('/') {
-            if let Some(&parent_idx) = path_index.get(parent_path) {
-                to_read.push(node.node_id.clone());
-                targets.push((parent_idx, kind));
-            }
+        if let Some((parent_path, _)) = node.path.rsplit_once('/')
+            && let Some(&parent_idx) = path_index.get(parent_path)
+        {
+            to_read.push(node.node_id.clone());
+            targets.push((parent_idx, kind));
         }
     }
 

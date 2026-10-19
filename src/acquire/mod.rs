@@ -103,17 +103,17 @@ async fn run_tasks(
         .await?;
         // Cache any reconstructed browse paths back into the source config so
         // later runs can skip the inverse browse.
-        if let Some(path) = config_path {
-            if !resolved.path_updates.is_empty() {
-                if let Err(e) = persist_node_paths(path, &resolved.path_updates) {
-                    warn!(error = %e, "failed to cache browse paths into config");
-                } else {
-                    info!(
-                        count = resolved.path_updates.len(),
-                        config = %path.display(),
-                        "cached reconstructed browse paths into config"
-                    );
-                }
+        if let Some(path) = config_path
+            && !resolved.path_updates.is_empty()
+        {
+            if let Err(e) = persist_node_paths(path, &resolved.path_updates) {
+                warn!(error = %e, "failed to cache browse paths into config");
+            } else {
+                info!(
+                    count = resolved.path_updates.len(),
+                    config = %path.display(),
+                    "cached reconstructed browse paths into config"
+                );
             }
         }
         resolved.nodes
@@ -203,14 +203,12 @@ async fn run_tasks(
     }
 
     // Bound continuous tasks by duration if requested.
-    if has_continuous {
-        if let Some(d) = duration {
-            let timer_cancel = cancel.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(d).await;
-                timer_cancel.store(true, Ordering::Relaxed);
-            });
-        }
+    if has_continuous && let Some(d) = duration {
+        let timer_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(d).await;
+            timer_cancel.store(true, Ordering::Relaxed);
+        });
     }
 
     while set.join_next().await.is_some() {}

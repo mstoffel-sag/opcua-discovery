@@ -983,11 +983,11 @@ impl App {
         // Keep the selection valid against the new visible set.
         let current = self.selected_idx();
         self.rebuild_visible();
-        if let Some(idx) = current {
-            if let Some(pos) = self.visible.iter().position(|&v| v == idx) {
-                self.selected = pos;
-                self.list_state.select(Some(pos));
-            }
+        if let Some(idx) = current
+            && let Some(pos) = self.visible.iter().position(|&v| v == idx)
+        {
+            self.selected = pos;
+            self.list_state.select(Some(pos));
         }
         self.status = if self.vars_only {
             "variables-only view (V to show all)".into()
@@ -1706,10 +1706,10 @@ impl App {
                     "Subscribable",
                     if is_subscribable(attrs) { "yes" } else { "no" },
                 ));
-                if let Some(desc) = &attrs.description {
-                    if !desc.is_empty() {
-                        lines.push(detail_line("Description", desc));
-                    }
+                if let Some(desc) = &attrs.description
+                    && !desc.is_empty()
+                {
+                    lines.push(detail_line("Description", desc));
                 }
             } else {
                 lines.push(Line::from(Span::styled(
@@ -2186,7 +2186,7 @@ async fn export_job(
             if seen.insert(record.node_id.clone()) {
                 records.push(record);
                 processed += 1;
-                if processed % 64 == 0 {
+                if processed.is_multiple_of(64) {
                     let _ = tx.send(JobMsg::Progress { processed }).await;
                 }
             }
@@ -2260,7 +2260,7 @@ async fn collect_job(
             if is_point_record(&record) && seen.insert(record.node_id.clone()) {
                 nodes.push((record, root_mode));
             }
-            if processed % 64 == 0 {
+            if processed.is_multiple_of(64) {
                 let _ = tx.send(JobMsg::Progress { processed }).await;
             }
         }

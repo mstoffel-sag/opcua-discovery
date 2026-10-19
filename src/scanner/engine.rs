@@ -314,12 +314,12 @@ impl Worker {
                 .then(|| parent.to_string()),
         };
 
-        if self.config.preview_values && record.subscribable {
-            if let Ok(values) = read_values(&self.session, std::slice::from_ref(node_id)).await {
-                if let Some(snapshot) = values.into_iter().next() {
-                    record.current_value = snapshot.value;
-                }
-            }
+        if self.config.preview_values
+            && record.subscribable
+            && let Ok(values) = read_values(&self.session, std::slice::from_ref(node_id)).await
+            && let Some(snapshot) = values.into_iter().next()
+        {
+            record.current_value = snapshot.value;
         }
 
         record
@@ -357,11 +357,11 @@ impl Worker {
             if let Some(rs) = result.references.take() {
                 for r in rs {
                     refs.push(r);
-                    if let Some(max) = self.config.max_children {
-                        if refs.len() > max {
-                            truncated = true;
-                            break;
-                        }
+                    if let Some(max) = self.config.max_children
+                        && refs.len() > max
+                    {
+                        truncated = true;
+                        break;
                     }
                 }
             }
@@ -376,11 +376,11 @@ impl Worker {
                 .ok_or(StatusCode::BadUnexpectedError)?;
         }
 
-        if let Some(max) = self.config.max_children {
-            if refs.len() > max {
-                refs.truncate(max);
-                truncated = true;
-            }
+        if let Some(max) = self.config.max_children
+            && refs.len() > max
+        {
+            refs.truncate(max);
+            truncated = true;
         }
         Ok((refs, truncated))
     }

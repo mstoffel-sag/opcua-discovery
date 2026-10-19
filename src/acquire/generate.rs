@@ -331,10 +331,10 @@ pub fn update_node_paths_in_toml(original: &str, updates: &[(String, String)]) -
 
     for table in nodes.iter_mut() {
         let id = table.get("id").and_then(|v| v.as_str()).map(str::to_string);
-        if let Some(id) = id {
-            if let Some((_, path)) = updates.iter().find(|(uid, _)| uid == &id) {
-                table["path"] = value(path.clone());
-            }
+        if let Some(id) = id
+            && let Some((_, path)) = updates.iter().find(|(uid, _)| uid == &id)
+        {
+            table["path"] = value(path.clone());
         }
     }
 
